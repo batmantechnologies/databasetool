@@ -1,12 +1,17 @@
-use std::path::PathBuf;
-use chrono::Local;
-use std::fs;
 use std::process::Command;
 use std::env;
-use crate::utils::databases::DATABASES;
 use crate::utils::setting::check_db_connection;
 use std::path::Path;
 use url::Url;
+
+fn get_database_list() -> Vec<String> {
+    // Read the DATABASE_LIST from the environment variable
+    env::var("DATABASE_LIST")
+        .expect("DATABASE_LIST must be set")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect()
+}
 
 pub fn extract_archive() -> String {
 
@@ -35,7 +40,9 @@ pub fn extract_archive() -> String {
 
 
 pub fn verify_files(timestamp: &str) {
-    for db in DATABASES {
+    let databases = get_database_list();
+
+    for db in databases {
         let dump_file = format!("/tmp/databasebackup/extract/{}/{}_{}.dump", timestamp, db, timestamp);
         if !Path::new(&dump_file).exists() {
             println!("Missing file for {}", db);
@@ -52,13 +59,14 @@ pub fn restore_databases(timestamp: &str) {
     let user = parsed.username();
     let port = parsed.port().unwrap_or(5432);
     let password = parsed.password().unwrap_or("");
+    let databases = get_database_list();
 
-    for db in DATABASES {
+    for db in databases {
         let restored_db_name = format!("{}{}", db, "_restored");
         let dump_path = format!("/tmp/databasebackup/extract/{}/{}_{}.dump", timestamp, db, timestamp);
 
         // Create DB
-        let status = Command::new("createdb")
+        let _ = Command::new("createdb")
                             .env("PGPASSWORD", password) // ✅ also here
                             .args(["-U", user, "-h", host, "-p", &port.to_string(), &restored_db_name])
                             .status()

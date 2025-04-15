@@ -4,12 +4,16 @@ use chrono::Local;
 use std::fs;
 use std::process::Command;
 use std::env;
-use std::path::Path;
-use crate::utils::databases::DATABASES;
 use crate::utils::setting::check_db_connection;
-use std::fs::OpenOptions;
-use std::io::Write;
-use postgres::{Client, NoTls};
+
+fn get_database_list() -> Vec<String> {
+    // Read the DATABASE_LIST from the environment variable
+    env::var("DATABASE_LIST")
+        .expect("DATABASE_LIST must be set")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect()
+}
 
 pub fn create_backup_dir() -> PathBuf {
     let timestamp = Local::now().format("%Y-%m-%d_%H_%M_%S").to_string();
@@ -19,13 +23,16 @@ pub fn create_backup_dir() -> PathBuf {
     fs::create_dir_all(&backup_path).unwrap();
     fs::create_dir_all(&local_path).unwrap();
 
+    println!("Backup is stored at: {}", backup_path);
+
     PathBuf::from(backup_path)
 }
 
 pub fn dump_databases(backup_dir: &PathBuf) {
     let source_url = env::var("SOURCE_DATABASE_URL").expect("SOURCE_DATABASE_URL must be set");
+    let databases = get_database_list();
 
-    for db in DATABASES {
+    for db in databases {
         let timestamp = backup_dir.file_name().unwrap().to_string_lossy();
         let filename = format!("{}_{}.dump", db, timestamp);
         println!("Backing up {}", db);
