@@ -98,4 +98,5 @@ pub fn run_restore_flow() {
     let timestamp = extract_archive();
     verify_files(&timestamp);
     restore_databases(&timestamp);
+    println!("\n✅ Restore completed.");
 }

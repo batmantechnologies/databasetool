@@ -62,4 +62,5 @@ pub fn run_backup_flow() {
     let backup_dir = create_backup_dir();
     dump_databases(&backup_dir);
     compress_backup(&backup_dir);
+    println!("\n✅ Backup completed.");
 }
