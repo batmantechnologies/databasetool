@@ -1,102 +1,489 @@
-use std::process::Command;
 use std::env;
-use crate::utils::setting::check_db_connection;
+use std::fs;
 use std::path::Path;
+use std::fs::File;
+use std::io::{BufReader, BufRead};
+use sqlx::{PgPool, Executor, Error};
+use sqlx::postgres::PgPoolOptions;
 use url::Url;
+use regex::Regex;
+use anyhow::{Result, Context};
+use crate::backup::logic::TEMP_BACKUP_ROOT;
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
+use sqlparser::ast::Statement as SqlStatement;
+use sqlparser::ast::{ColumnOptionDef,ColumnOption,Expr};
+use std::collections::HashSet;
+use std::fmt;
 
-fn get_database_list() -> Vec<String> {
-    // Read the DATABASE_LIST from the environment variable
-    env::var("DATABASE_LIST")
-        .expect("DATABASE_LIST must be set")
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .collect()
+#[derive(Debug, Clone)]
+enum CustomStatement {
+    Parsed(SqlStatement),
+    SkippedFunction(String),
+    SkippedConstraint(String),
+    Unparsed(String),
 }
 
-pub fn extract_archive() -> String {
-
-    let archive_file = env::var("ARCHIVE_FILE_PATH").expect("ARCHIVE_FILE_PATH must be set");
-
-    let file_name = Path::new(&archive_file)
-    .file_name()
-    .unwrap()
-    .to_string_lossy()
-    .to_string();
-
-    let timestamp = file_name
-        .trim_start_matches("database_backup_")
-        .trim_end_matches(".tar.gz")
-        .to_string();
-
-    let backup_dir = "/tmp/databasebackup";
-
-    // ✅ Just extract — no need to create the subdir
-    let _ = Command::new("tar")
-        .args(["-xzvf", &archive_file, "-C", &format!("{}/extract", backup_dir)])
-        .status();
-
-    timestamp
-}
-
-
-pub fn verify_files(timestamp: &str) {
-    let databases = get_database_list();
-
-    for db in databases {
-        let dump_file = format!("/tmp/databasebackup/extract/{}/{}_{}.dump", timestamp, db, timestamp);
-        if !Path::new(&dump_file).exists() {
-            println!("Missing file for {}", db);
+impl fmt::Display for CustomStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CustomStatement::Parsed(stmt) => write!(f, "{}", stmt),
+            CustomStatement::SkippedFunction(sql) => write!(f, "{}", sql),
+            CustomStatement::SkippedConstraint(sql) => write!(f, "{}", sql),
+            CustomStatement::Unparsed(sql) => write!(f, "{}", sql),
         }
     }
 }
 
-pub fn restore_databases(timestamp: &str) {
-    let target_url = env::var("TARGET_DATABASE_URL").expect("TARGET_DATABASE_URL must be set");
+pub async fn restore_schema(pool: &PgPool, schema_path: &str) -> Result<()> {
+    let schema_content = fs::read_to_string(schema_path)
+        .with_context(|| format!("Failed to read schema file: {}", schema_path))?;
 
-    // Parse the URL to extract components
-    let parsed = Url::parse(&target_url).expect("Invalid TARGET_DATABASE_URL");
-    let host = parsed.host_str().unwrap_or("localhost");
-    let user = parsed.username();
-    let port = parsed.port().unwrap_or(5432);
-    let password = parsed.password().unwrap_or("");
-    let databases = get_database_list();
+    // Split into individual statements
+    let statements = split_sql_with_dollar_quotes(&schema_content);
 
-    for db in databases {
-        let restored_db_name = format!("{}{}", db, "_restored");
-        let dump_path = format!("/tmp/databasebackup/extract/{}/{}_{}.dump", timestamp, db, timestamp);
+    // Separate statements into sequences, tables, and others
+    let (sequences, rest): (Vec<_>, Vec<_>) = statements.into_iter()
+        .partition(|stmt| stmt.contains("CREATE SEQUENCE"));
+    
+    let (tables, others): (Vec<_>, Vec<_>) = rest.into_iter()
+        .partition(|stmt| stmt.contains("CREATE TABLE"));
 
-        // Create DB
-        let _ = Command::new("createdb")
-                            .env("PGPASSWORD", password) // ✅ also here
-                            .args(["-U", user, "-h", host, "-p", &port.to_string(), &restored_db_name])
-                            .status()
-                            .expect("Failed to create database");
+    // Phase 1: Create sequences first
+    for stmt in sequences {
+        let mut transaction = pool.begin().await?;
+        match sqlx::query(&stmt).execute(&mut *transaction).await {
+            Ok(_) => {
+                transaction.commit().await?;
+                println!("✅ Created sequence");
+            }
+            Err(e) if e.to_string().contains("already exists") => {
+                transaction.rollback().await?;
+                println!("ℹ Sequence already exists");
+            }
+            Err(e) => {
+                transaction.rollback().await?;
+                eprintln!("⚠️ Failed to create sequence: {}", e);
+                return Err(e.into());
+            }
+        }
+    }
 
-        // Restore DB
-        Command::new("pg_restore")
-                .env("PGPASSWORD", password)
-                .args([
-                    "--clean", "--if-exists", "--no-owner",
-                    "-U", user,
-                    "-h", host,
-                    "-p", &port.to_string(),
-                    "-d", &restored_db_name,
-                    &dump_path
-                ])
-                .status()
-                .expect("Failed to execute pg_restore");
+    // Phase 2: Create tables with retry logic
+    let mut remaining_tables = tables;
+    let mut attempts = 0;
+    const MAX_ATTEMPTS: usize = 3;
+
+    while !remaining_tables.is_empty() && attempts < MAX_ATTEMPTS {
+        attempts += 1;
+        let mut next_remaining = Vec::new();
+
+        for stmt in remaining_tables {
+            let mut transaction = pool.begin().await?;
+            match sqlx::query(&stmt).execute(&mut *transaction).await {
+                Ok(_) => {
+                    transaction.commit().await?;
+                    if let Some(table_name) = extract_table_name_from_create(&stmt) {
+                        println!("✅ Created table: {}", table_name);
+                    }
                 }
+                Err(e) if e.to_string().contains("already exists") => {
+                    transaction.rollback().await?;
+                    println!("ℹ Table already exists");
+                }
+                Err(e) => {
+                    transaction.rollback().await?;
+                    eprintln!("⚠️ Failed to create table (attempt {}): {}", attempts, e);
+                    next_remaining.push(stmt);
+                }
+            }
+        }
+
+        remaining_tables = next_remaining;
+    }
+
+    if !remaining_tables.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Failed to create {} tables after {} attempts",
+            remaining_tables.len(),
+            MAX_ATTEMPTS
+        ));
+    }
+
+    // Phase 3: Process other statements
+    for stmt in others {
+        let mut transaction = pool.begin().await?;
+        match sqlx::query(&stmt).execute(&mut *transaction).await {
+            Ok(_) => transaction.commit().await?,
+            Err(e) if e.to_string().contains("already exists") => {
+                transaction.rollback().await?;
+                println!("ℹ Object already exists");
+            }
+            Err(e) => {
+                transaction.rollback().await?;
+                eprintln!("⚠️ Failed to execute statement (skipping): {}", e);
+            }
+        }
+    }
+
+    Ok(())
 }
 
+pub async fn restore_from_sql_file(pool: &PgPool, sql_path: &str) -> Result<()> {
+    let sql = fs::read_to_string(sql_path)
+        .with_context(|| format!("Failed to read SQL file: {}", sql_path))?;
 
-pub fn run_restore_flow() {
-    let source_url = env::var("TARGET_DATABASE_URL").expect("TARGET_DATABASE_URL must be set");
-    if !check_db_connection(&source_url) {
-        println!("❌ Cannot proceed with restore. Exiting.");
-        return;
+    let statements = split_sql_with_dollar_quotes(&sql);
+    let batch_size = 100; // Process in batches to avoid memory issues
+    let mut total_processed = 0;
+
+    for chunk in statements.chunks(batch_size) {
+        println!("Processing statements {}-{} of {}",
+            total_processed + 1,
+            total_processed + chunk.len(),
+            statements.len());
+
+        // Execute statements individually to avoid prepared statement issues
+        for stmt in chunk {
+            total_processed += 1;
+            // Split on semicolons and process each command separately
+            let commands: Vec<&str> = stmt.split(';')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            
+            for cmd in commands {
+                if let Err(e) = sqlx::query(cmd).execute(pool).await {
+                    // Handle missing tables for INSERT statements
+                    if e.to_string().contains("relation") && e.to_string().contains("does not exist") {
+                        if let Some(table_name) = extract_table_name(stmt) {
+                            eprintln!("Table {} missing, attempting to create", table_name);
+                            if create_table_from_insert(stmt, pool).await.is_ok() {
+                                // Retry the statement after creating table
+                                if let Err(e) = sqlx::query(stmt).execute(pool).await {
+                                    eprintln!("⚠️ Failed to execute statement {} after creating table (skipping): {}\n{}",
+                                        total_processed, e, stmt);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    eprintln!("⚠️ Failed to execute statement {} (skipping): {}\n{}",
+                        total_processed, e, stmt);
+                }
+            }
+        }
     }
-    let timestamp = extract_archive();
-    verify_files(&timestamp);
-    restore_databases(&timestamp);
+
+    println!("✅ Data restore completed ({} statements processed)", total_processed);
+    Ok(())
+}
+
+fn split_sql_with_dollar_quotes(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut in_dollar_quote = false;
+    let mut quote_tag = String::new();
+    let mut in_single_quote = false;
+    let mut in_comment = false;
+
+    for line in sql.lines() {
+        let mut chars = line.chars().peekable();
+        
+        while let Some(c) = chars.next() {
+            // Handle line comments
+            if !in_dollar_quote && !in_single_quote && c == '-' && chars.peek() == Some(&'-') {
+                chars.next(); // Skip second '-'
+                in_comment = true;
+                break;
+            }
+
+            match c {
+                '\'' if !in_dollar_quote && !in_comment => in_single_quote = !in_single_quote,
+                '$' if !in_single_quote && !in_comment => {
+                    if chars.peek() == Some(&'$') {
+                        chars.next();
+                        if !in_dollar_quote {
+                            // Start of dollar quote
+                            let mut tag = String::new();
+                            while let Some(&tc) = chars.peek() {
+                                if tc == '$' { break; }
+                                tag.push(tc);
+                                chars.next();
+                            }
+                            quote_tag = tag;
+                            in_dollar_quote = true;
+                        } else {
+                            // Check for end tag
+                            let mut potential_end = String::new();
+                            while let Some(&tc) = chars.peek() {
+                                if tc == '$' { break; }
+                                potential_end.push(tc);
+                                chars.next();
+                            }
+                            if potential_end == quote_tag {
+                                in_dollar_quote = false;
+                                quote_tag.clear();
+                            }
+                        }
+                    }
+                }
+                ';' if !in_dollar_quote && !in_single_quote && !in_comment => {
+                    current.push(c);
+                    if !current.trim().is_empty() {
+                        statements.push(current.trim().to_string());
+                    }
+                    current = String::new();
+                    continue;
+                }
+                _ => {}
+            }
+            current.push(c);
+        }
+        
+        if !in_comment && !in_dollar_quote {
+            current.push('\n');
+        }
+        in_comment = false;
+    }
+
+    if !current.trim().is_empty() {
+        statements.push(current.trim().to_string());
+    }
+
+    // Handle function definitions as single statements
+    let mut final_statements = Vec::new();
+    let mut current_func = String::new();
+    let mut in_function = false;
+
+    for stmt in statements {
+        if stmt.contains("CREATE OR REPLACE FUNCTION") ||
+           stmt.contains("CREATE FUNCTION") {
+            in_function = true;
+            current_func = stmt;
+            continue;
+        }
+
+        if in_function {
+            current_func.push_str(&stmt);
+            if stmt.contains("LANGUAGE") && stmt.contains("$$") {
+                final_statements.push(current_func.trim().to_string());
+                current_func.clear();
+                in_function = false;
+            }
+        } else {
+            final_statements.push(stmt);
+        }
+    }
+
+    if !current_func.is_empty() {
+        final_statements.push(current_func);
+    }
+
+    final_statements
+}
+
+fn separate_statements(statements: &[String]) -> (Vec<String>, Vec<String>) {
+    let create_table_re = Regex::new(r"(?i)^CREATE\s+TABLE").unwrap();
+
+    let mut create = vec![];
+    let mut others = vec![];
+
+    for stmt in statements {
+        if create_table_re.is_match(stmt.trim_start()) {
+            create.push(stmt.clone());
+        } else {
+            others.push(stmt.clone());
+        }
+    }
+
+    (create, others)
+}
+pub async fn run_restore_flow(archive_path: &str) {
+    let original_url = env::var("TARGET_DATABASE_URL").expect("TARGET_DATABASE_URL must be set");
+    let db_names = env::var("DATABASE_LIST").expect("DATABASE_LIST must be set");
+    println!("------1-----------");
+    // Process each database in the comma-separated list
+    for db_name in db_names.split(',').map(|s| s.trim()) {
+        let restored_db_name = format!("{}_restored", db_name);
+        
+        // Create admin connection to postgres database
+        let mut admin_url = Url::parse(&original_url).expect("Invalid database URL");
+        admin_url.set_path("/postgres");
+        
+        let admin_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url.to_string())
+            .await
+            .expect("Failed to create admin database pool");
+
+        // Check if restored database already exists
+        let db_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)"
+        )
+        .bind(&restored_db_name)
+        .fetch_one(&admin_pool)
+        .await
+        .expect("Failed to check database existence");
+
+        if !db_exists {
+            println!("Creating empty restored database '{}'...", restored_db_name);
+            sqlx::query(&format!(r#"CREATE DATABASE "{}""#, restored_db_name))
+                .execute(&admin_pool)
+                .await
+                .expect("Failed to create empty restored database");
+        } else {
+            println!("Restored database '{}' already exists", restored_db_name);
+        }
+
+        // Create target URL for restored database
+        let mut target_url = Url::parse(&original_url).expect("Invalid database URL");
+        target_url.set_path(&format!("/{}", restored_db_name));
+        let target_url = target_url.to_string();
+
+        if !check_db_connection(&target_url).await {
+            println!("❌ Cannot connect to database. Exiting.");
+            return;
+        }
+
+        // Show target database info
+        let target_db = Url::parse(&target_url)
+            .expect("Invalid database URL")
+            .path()
+            .trim_start_matches('/')
+            .to_string();
+        println!("🔌 Connecting to target database: {}", target_db);
+        
+        // Create pool connection for our target DB
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&target_url)
+            .await
+            .expect("Failed to create database pool");
+
+        // Print existing tables in the database
+        println!("\n📋 Existing tables in database:");
+        match sqlx::query_scalar::<_, String>(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+        )
+        .fetch_all(&pool)
+        .await {
+            Ok(tables) => {
+                if tables.is_empty() {
+                    println!("No tables found in database");
+                } else {
+                    for table in &tables {
+                        println!("- {}", table);
+                    }
+                    println!("Found {} tables", tables.len());
+                }
+            }
+            Err(e) => eprintln!("⚠️ Failed to list tables: {}", e),
+        }
+
+        let path = std::path::Path::new(archive_path);
+        
+        if path.is_dir() {
+            // Handle directory case - look for schema and data files
+            let timestamp = path.file_name().unwrap().to_string_lossy();
+
+            let schema_path = format!("{}/{}_{}_schema.sql", archive_path, db_name, timestamp);
+            let data_path = format!("{}/{}_{}_data.sql", archive_path, db_name, timestamp);
+        
+            if !Path::new(&schema_path).exists() || !Path::new(&data_path).exists() {
+                println!("❌ Could not find both schema and data files in directory");
+                println!("   Expected files:");
+                println!("   - {}", schema_path);
+                println!("   - {}", data_path);
+                return;
+            }
+
+            // Restore schema first
+            if let Err(e) = restore_schema(&pool, &schema_path).await {
+                println!("❌ Schema restore failed: {}", e);
+                return;
+            }
+
+            // Then restore data
+            println!("Starting data restoration...");
+            if let Err(e) = restore_from_sql_file(&pool, &data_path).await {
+                println!("❌ Data restore failed: {}", e);
+                return;
+            }
+            println!("✅ Data restoration completed");
+        } else {
+            // Handle single file case (legacy)
+            if let Err(e) = restore_from_sql_file(&pool, archive_path).await {
+                println!("❌ Restore failed: {}", e);
+                return;
+            }
+        }
+    }
+
     println!("\n✅ Restore completed.");
 }
+
+async fn check_db_connection(db_url: &str) -> bool {
+    PgPoolOptions::new().max_connections(1).connect(db_url).await.is_ok()
+}
+
+fn extract_table_name_from_create(query: &str) -> Option<String> {
+    if query.starts_with("CREATE TABLE") {
+        let parts: Vec<&str> = query.split_whitespace().collect();
+        if parts.len() >= 3 {
+            Some(parts[2].trim_matches('"').to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn extract_table_name(query: &str) -> Option<String> {
+    if query.starts_with("INSERT INTO") {
+        let start = query.find("INSERT INTO")? + "INSERT INTO".len();
+        let end = query[start..].find(' ').map(|i| start + i).unwrap_or(query.len());
+        Some(query[start..end].trim().trim_matches('"').to_string())
+    } else {
+        None
+    }
+}
+
+async fn check_table_exists(pool: &PgPool, table_name: &str) -> Result<bool, sqlx::Error> {
+    let query = format!(
+        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{}')",
+        table_name
+    );
+    sqlx::query_scalar::<_, bool>(&query)
+        .fetch_one(pool)
+        .await
+}
+
+async fn create_table_from_insert(query: &str, pool: &PgPool) -> Result<(), sqlx::Error> {
+    eprintln!("Creating table from INSERT statement");
+    let table_name = extract_table_name(query)
+        .ok_or(sqlx::Error::Protocol("Could not extract table name".into()))?;
+    
+    // Extract column names from INSERT statement
+    let cols_start = query.find('(')
+        .ok_or(sqlx::Error::Protocol("Could not find column list".into()))? + 1;
+    let cols_end = query[cols_start..].find(')')
+        .ok_or(sqlx::Error::Protocol("Could not find column list end".into()))?;
+    let cols_str = &query[cols_start..cols_start + cols_end];
+    
+    let columns: Vec<&str> = cols_str.split(',')
+        .map(|s| s.trim().trim_matches('"'))
+        .collect();
+    
+    // Create table with TEXT columns by default (simplest approach)
+    let create_sql = format!(
+        "CREATE TABLE IF NOT EXISTS \"{}\" ({})",
+        table_name,
+        columns.iter().map(|c| format!("\"{}\" TEXT", c)).collect::<Vec<_>>().join(", ")
+    );
+    
+    sqlx::query(&create_sql).execute(pool).await?;
+    Ok(())
+}
+

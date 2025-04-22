@@ -1,5 +1,5 @@
 // src/main.rs
-
+use std::path::Path;
 mod utils;
 mod backup;
 mod restore;
@@ -8,7 +8,8 @@ use std::env;
 use backup::logic::run_backup_flow;
 use restore::logic::run_restore_flow;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     dotenv().ok();
 
     // Check for CLI argument first
@@ -20,8 +21,8 @@ fn main() {
     };
 
     match choice.as_str() {
-        "1" => run_backup(),
-        "2" => run_restore(),
+        "1" => run_backup().await,
+        "2" => run_restore().await,
         _ => println!("❌ Invalid choice. Exiting."),
     }
 }
@@ -41,14 +42,24 @@ fn prompt_choice() -> String {
 }
 
 
-fn run_backup() {
+async fn run_backup() {
     println!("\nStarting Backup...");
 
-    run_backup_flow();
+    run_backup_flow().await;
 }
 
-fn run_restore() {
+async fn run_restore() {
     println!("\nStarting Restore...");
     
-    run_restore_flow();
+    // Get archive path from environment variable
+    let archive_path = env::var("ARCHIVE_FILE_PATH").expect("ARCHIVE_FILE_PATH must be set");
+
+    // Validate archive exists
+    if !Path::new(&archive_path).exists() {
+        println!("❌ Archive file not found at: {}", archive_path);
+        return;
+    }
+
+    // Call the restore flow from logic module
+    restore::logic::run_restore_flow(&archive_path).await;
 }
