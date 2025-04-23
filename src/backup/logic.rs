@@ -77,7 +77,7 @@ pub fn setup_backup_dirs() -> Result<(PathBuf, PathBuf), anyhow::Error> {
 
 /// Creates timestamped backup directory inside the temp working dir
 pub fn create_timestamped_backup_dir(temp_root: &Path) -> Result<PathBuf, anyhow::Error> {
-    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let timestamp = chrono::Local::now().format("%Y-%m-%d_%H_%M_%S").to_string();
     let backup_dir = temp_root.join(&timestamp);
 
     fs::create_dir_all(&backup_dir)
