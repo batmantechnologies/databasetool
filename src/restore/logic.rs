@@ -1,14 +1,16 @@
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::{BufReader, BufRead};
+use flate2::read::GzDecoder;
+use tar::Archive;
+use tempfile::tempdir;
 use sqlx::{PgPool, Executor, Error};
 use sqlx::postgres::PgPoolOptions;
 use url::Url;
 use regex::Regex;
 use anyhow::{Result, Context};
-use crate::backup::logic::TEMP_BACKUP_ROOT;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser::ast::Statement as SqlStatement;
@@ -299,16 +301,44 @@ fn separate_statements(statements: &[String]) -> (Vec<String>, Vec<String>) {
 
     (create, others)
 }
-pub async fn run_restore_flow(archive_path: &str) {
-    let original_url = env::var("TARGET_DATABASE_URL").expect("TARGET_DATABASE_URL must be set");
-    let db_names = env::var("DATABASE_LIST").expect("DATABASE_LIST must be set");
-    println!("------1-----------");
+pub async fn run_restore_flow() -> Result<(), anyhow::Error> {
+    let original_url = env::var("TARGET_DATABASE_URL").context("TARGET_DATABASE_URL must be set")?;
+    let original_url = if original_url.starts_with("postgres://") || original_url.starts_with("postgresql://") {
+        original_url
+    } else {
+        format!("postgres://{}", original_url)
+    };
+    let db_names = env::var("DATABASE_LIST").context("DATABASE_LIST must be set")?;
+    let archive_path = env::var("ARCHIVE_FILE_PATH").context("ARCHIVE_FILE_PATH must be set")?;
+    
+    let path = Path::new(&archive_path);
+    let mut temp_dir: Option<tempfile::TempDir> = None;
+    let working_path: PathBuf;
+
+    // Handle tar.gz files
+    if path.extension().map_or(false, |ext| ext == "gz") &&
+       path.file_stem().map_or(false, |stem| stem.to_string_lossy().ends_with(".tar")) {
+        println!("🔍 Detected tar.gz archive, extracting...");
+        
+        let dir = tempdir().context("Failed to create temp directory")?;
+        let file = File::open(path).context("Failed to open archive file")?;
+        let tar = GzDecoder::new(file);
+        let mut archive = Archive::new(tar);
+        
+        archive.unpack(dir.path()).context("Failed to extract archive")?;
+        working_path = dir.path().to_path_buf();
+        temp_dir = Some(dir);
+    } else {
+        working_path = path.to_path_buf();
+    }
+
+    println!("ℹ Using backup path: {}", working_path.display());
     // Process each database in the comma-separated list
     for db_name in db_names.split(',').map(|s| s.trim()) {
         let restored_db_name = format!("{}_restored", db_name);
         
         // Create admin connection to postgres database
-        let mut admin_url = Url::parse(&original_url).expect("Invalid database URL");
+        let mut admin_url = Url::parse(&original_url).context("Invalid database URL - must be in format postgres://user:password@host:port/database")?;
         admin_url.set_path("/postgres");
         
         let admin_pool = PgPoolOptions::new()
@@ -333,7 +363,8 @@ pub async fn run_restore_flow(archive_path: &str) {
                 .await
                 .expect("Failed to create empty restored database");
         } else {
-            println!("Restored database '{}' already exists", restored_db_name);
+           println!("Restored database '{}' already exists", restored_db_name);
+           return Ok(());
         }
 
         // Create target URL for restored database
@@ -343,7 +374,7 @@ pub async fn run_restore_flow(archive_path: &str) {
 
         if !check_db_connection(&target_url).await {
             println!("❌ Cannot connect to database. Exiting.");
-            return;
+            return Ok(());
         }
 
         // Show target database info
@@ -381,46 +412,72 @@ pub async fn run_restore_flow(archive_path: &str) {
             Err(e) => eprintln!("⚠️ Failed to list tables: {}", e),
         }
 
-        let path = std::path::Path::new(archive_path);
-        
-        if path.is_dir() {
-            // Handle directory case - look for schema and data files
-            let timestamp = path.file_name().unwrap().to_string_lossy();
+        let path = &working_path;
 
-            let schema_path = format!("{}/{}_{}_schema.sql", archive_path, db_name, timestamp);
-            let data_path = format!("{}/{}_{}_data.sql", archive_path, db_name, timestamp);
-        
-            if !Path::new(&schema_path).exists() || !Path::new(&data_path).exists() {
-                println!("❌ Could not find both schema and data files in directory");
-                println!("   Expected files:");
-                println!("   - {}", schema_path);
-                println!("   - {}", data_path);
-                return;
+        if path.is_dir() {
+            println!("📁 Processing directory backup format");
+            println!("ℹ Directory contents:");
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                println!("- {}", entry.path().display());
             }
 
+            let timestamp = path.file_name()
+                .and_then(|n| n.to_str())
+                .context("Invalid backup directory name - should be in format YYYYMMDD_HHMMSS")?;
+            
+            println!("ℹ Extracted timestamp from directory name: {}", timestamp);
+
+            println!("🔍 Looking for backup files in: {}", path.display());
+            let schema_path = path.join(format!("{}_{}_schema.sql", db_name, timestamp));
+            let data_path = path.join(format!("{}_{}_data.sql", db_name, timestamp));
+
+            println!("ℹ Expected schema file: {}", schema_path.display());
+            println!("ℹ Expected data file: {}", data_path.display());
+
+            if !schema_path.exists() {
+                return Err(anyhow::anyhow!(
+                    "Schema file not found: {}",
+                    schema_path.display()
+                ));
+            }
+            if !data_path.exists() {
+                return Err(anyhow::anyhow!(
+                    "Data file not found: {}",
+                    data_path.display()
+                ));
+            }
+
+            println!("✅ Found both schema and data files");
+
             // Restore schema first
-            if let Err(e) = restore_schema(&pool, &schema_path).await {
-                println!("❌ Schema restore failed: {}", e);
-                return;
+            println!("🔄 Starting schema restoration...");
+            match restore_schema(&pool, &schema_path.to_string_lossy()).await {
+                Ok(_) => println!("✅ Schema restoration completed"),
+                Err(e) => {
+                    eprintln!("❌ Schema restoration failed: {}", e);
+                    return Err(e);
+                }
             }
 
             // Then restore data
-            println!("Starting data restoration...");
-            if let Err(e) = restore_from_sql_file(&pool, &data_path).await {
-                println!("❌ Data restore failed: {}", e);
-                return;
+            println!("🔄 Starting data restoration...");
+            match restore_from_sql_file(&pool, &data_path.to_string_lossy()).await {
+                Ok(_) => println!("✅ Data restoration completed"),
+                Err(e) => {
+                    eprintln!("❌ Data restoration failed: {}", e);
+                    return Err(e);
+                }
             }
-            println!("✅ Data restoration completed");
         } else {
             // Handle single file case (legacy)
-            if let Err(e) = restore_from_sql_file(&pool, archive_path).await {
-                println!("❌ Restore failed: {}", e);
-                return;
-            }
+            restore_from_sql_file(&pool, &archive_path).await
+                .context("Restore failed")?;
         }
     }
 
     println!("\n✅ Restore completed.");
+    Ok(())
 }
 
 async fn check_db_connection(db_url: &str) -> bool {

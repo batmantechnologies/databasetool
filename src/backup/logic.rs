@@ -9,13 +9,12 @@ use std::{
 use anyhow::{Context, Result};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use url::Url;
-use crate::utils::setting::check_db_connection;
+use crate::utils::setting::{check_db_connection,get_row_count,serialize_value};
 use std::io::Seek;
 use std::io::SeekFrom;
-
-// Constants for configuration
-const DEFAULT_BACKUP_DIR: &str = "./backups";
-pub const TEMP_BACKUP_ROOT: &str = "./databasebackup"; // Changed from /tmp to local directory
+use aws_config::meta::region::RegionProviderChain;
+use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::primitives::ByteStream;
 
 /// Gets the list of databases to backup from environment variable
 fn get_database_list() -> Result<Vec<String>> {
@@ -26,48 +25,109 @@ fn get_database_list() -> Result<Vec<String>> {
         .collect()
 }
 
+fn get_local_backup_dir() -> PathBuf {
+    // First try environment variable
+    if let Ok(dir) = env::var("LOCAL_BACKUP_DIR") {
+        return PathBuf::from(dir);
+    }
+
+    // Fallback to system temp directory
+    let mut path = env::temp_dir();
+    path.push("database_backups");
+    path
+}
+
 /// Extracts the base URL without database name
 fn get_base_url_without_db(full_url: &str) -> Result<String> {
     let mut parsed = Url::parse(full_url).context("Invalid PostgreSQL URL")?;
     parsed.set_path("");
     Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
+/// Creates all necessary directories for backups
+pub fn setup_backup_dirs() -> Result<(PathBuf, PathBuf), anyhow::Error> {
+    // 1. Handle LOCAL_BACKUP_DIR (final storage location)
+    let local_backup_dir = env::var("LOCAL_BACKUP_DIR")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            let default = PathBuf::from("./backups");
+            println!("ℹ LOCAL_BACKUP_DIR not set, using default: {}", default.display());
+            Ok::<_, anyhow::Error>(default)
+        })?;
 
-/// Creates backup directory structure
-pub fn create_backup_dir() -> Result<PathBuf> {
-    // Create root temp directory first with debug output
-    println!("🛠 Attempting to create backup root: {}", TEMP_BACKUP_ROOT);
-    match fs::create_dir_all(TEMP_BACKUP_ROOT) {
-        Ok(_) => println!("✅ Created backup root directory"),
-        Err(e) => {
-            eprintln!("❌ Failed to create backup root: {}", e);
-            eprintln!("⚠️ Current /tmp permissions: {:?}",
-                fs::metadata("/tmp").map(|m| m.permissions()));
-            return Err(e).context(format!(
-                "Failed to create backup root directory: {}. \n\
-                Try running with elevated permissions or specify a different \
-                TEMP_BACKUP_ROOT in settings.rs",
-                TEMP_BACKUP_ROOT
-            ));
-        }
+    // 2. Handle TEMP_BACKUP_ROOT (working directory)
+    let temp_backup_root = env::var("TEMP_BACKUP_ROOT")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            let default = PathBuf::from("./temp_backups");
+            println!("ℹ TEMP_BACKUP_ROOT not set, using default: {}", default.display());
+            Ok::<_, anyhow::Error>(default)
+        })?;
+
+    // 3. Create directories if they don't exist
+    fs::create_dir_all(&local_backup_dir)
+        .context(format!("Failed to create local backup dir: {}", local_backup_dir.display()))?;
+    fs::create_dir_all(&temp_backup_root)
+        .context(format!("Failed to create temp working dir: {}", temp_backup_root.display()))?;
+
+    println!("✓ Local backup dir: {}", local_backup_dir.display());
+    println!("✓ Temp working dir: {}", temp_backup_root.display());
+
+    Ok((local_backup_dir, temp_backup_root))
+}
+
+/// Creates timestamped backup directory inside the temp working dir
+pub fn create_timestamped_backup_dir(temp_root: &Path) -> Result<PathBuf, anyhow::Error> {
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let backup_dir = temp_root.join(&timestamp);
+
+    fs::create_dir_all(&backup_dir)
+        .context(format!("Failed to create backup dir: {}", backup_dir.display()))?;
+
+    println!("✓ Created backup dir: {}", backup_dir.display());
+    Ok(backup_dir)
+}
+
+/// Stores backup in all locations
+pub fn store_backup_in_all_locations(
+    backup_dir: &Path,
+    local_dir: &Path,
+    temp_dir: &Path,
+) -> Result<PathBuf, anyhow::Error> {
+    let archive_name = format!(
+        "backup_{}.tar.gz",
+        backup_dir.file_name().unwrap().to_str().unwrap()
+    );
+
+    // 1. Create in local backup dir (primary location)
+    let primary_path = local_dir.join(&archive_name);
+    create_tar_archive(&backup_dir, &primary_path)?;
+
+    // 2. Copy to temp working dir
+    let temp_path = temp_dir.join(&archive_name);
+    if primary_path != temp_path {
+        fs::copy(&primary_path, &temp_path)
+            .context(format!("Failed to copy to temp dir: {}", temp_path.display()))?;
     }
-        
-    let timestamp = Local::now().format("%Y-%m-%d_%H_%M_%S").to_string();
-    let backup_path = format!("{}/{}", TEMP_BACKUP_ROOT, timestamp);
-    let local_path = env::var("LOCAL_BACKUP_DIR").unwrap_or(DEFAULT_BACKUP_DIR.to_string());
 
-    fs::create_dir_all(&backup_path)
-        .context("Failed to create temporary backup directory")?;
-    fs::create_dir_all(&local_path)
-        .context("Failed to create local backup directory")?;
+    Ok(primary_path)
+}
 
-    // Also create extract directory for restore operations
-    let extract_path = format!("{}/extract", TEMP_BACKUP_ROOT);
-    fs::create_dir_all(&extract_path)
-        .context("Failed to create extract directory")?;
+fn create_tar_archive(source_dir: &Path, dest_path: &Path) -> Result<(), anyhow::Error> {
+    let status = Command::new("tar")
+        .args([
+            "-czf",
+            dest_path.to_str().unwrap(),
+            "-C",
+            source_dir.parent().unwrap().to_str().unwrap(),
+            source_dir.file_name().unwrap().to_str().unwrap(),
+        ])
+        .status()
+        .context("Failed to execute tar command")?;
 
-    println!("📂 Backup directory created at: {}", backup_path);
-    Ok(PathBuf::from(backup_path))
+    if !status.success() {
+        return Err(anyhow::anyhow!("Tar failed with exit code {}", status));
+    }
+    Ok(())
 }
 
 /// Dumps database schema and data to files
@@ -123,77 +183,11 @@ pub async fn dump_databases(backup_dir: &Path) -> Result<()> {
             .connect(&format!("{}/{}", base_url, db))
             .await
             .context(format!("Failed to connect to database {}", db))?;
-    
-        // Check and create pg_get_tabledef function with robust error handling
-        println!("🔍 Checking for pg_get_tabledef function...");
-        match sqlx::query("SELECT 1 FROM pg_proc WHERE proname = 'pg_get_tabledef'")
-            .fetch_optional(&pool)
-            .await {
-            Ok(Some(_)) => println!("✅ pg_get_tabledef function exists"),
-            Ok(None) => {
-                println!("⚠ pg_get_tabledef not found, checking privileges...");
-                
-                // Check if we can create functions
-                match sqlx::query("SELECT has_function_privilege(current_user, 'CREATE')")
-                    .fetch_one(&pool)
-                    .await {
-                    Ok(row) => {
-                        let has_privilege: bool = row.get(0);
-                        if !has_privilege {
-                            println!("❌ No CREATE FUNCTION privilege, using fallback method");
-                        } else {
-                            println!("ℹ User has CREATE FUNCTION privilege, attempting to create...");
-                            match sqlx::query(
-                                r#"
-                                CREATE OR REPLACE FUNCTION public.pg_get_tabledef(table_name text)
-                                RETURNS text AS $$
-                                DECLARE
-                                    ddl text;
-                                BEGIN
-                                    SELECT 'CREATE TABLE ' || table_name || ' (' ||
-                                    string_agg(column_name || ' ' || data_type ||
-                                    CASE WHEN is_nullable = 'NO' THEN ' NOT NULL' ELSE '' END ||
-                                    CASE WHEN column_default IS NOT NULL THEN ' DEFAULT ' || column_default ELSE '' END,
-                                    ', ') || ');'
-                                    INTO ddl
-                                    FROM information_schema.columns
-                                    WHERE table_schema = 'public' AND table_name = $1
-                                    GROUP BY table_name;
-                                    
-                                    RETURN ddl;
-                                EXCEPTION WHEN others THEN
-                                    RETURN NULL;
-                                END;
-                                $$ LANGUAGE plpgsql;
-                                "#
-                            )
-                            .execute(&pool)
-                            .await {
-                                Ok(_) => println!("✅ Successfully created pg_get_tabledef function"),
-                                Err(e) => {
-                                    println!("❌ Failed to create pg_get_tabledef: {}", e);
-                                    println!("⚠ Falling back to manual table definitions");
-                                },
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        println!("❌ Failed to check privileges: {}", e);
-                        println!("⚠ Falling back to manual table definitions");
-                    },
-                }
-            },
-            Err(e) => {
-                println!("❌ Error checking for pg_get_tabledef: {}", e);
-                println!("⚠ Falling back to manual table definitions");
-            }
-        }
-    
+
         // Backup schema objects to schema file
         backup_schema(&pool, &mut schema_file).await
             .context(format!("Failed to backup schema for {}", db))?;
         writeln!(schema_file, "\nCOMMIT;")?;
-
 
         backup_table_data(&pool, &mut data_file).await
             .context(format!("Failed to backup data for {}", db))?;
@@ -458,156 +452,73 @@ async fn backup_table_data(pool: &PgPool, file: &mut File) -> Result<()> {
     Ok(())
 }
 
-async fn get_row_count(pool: &PgPool, table_name: &str) -> Result<i64> {
-    let count: Option<i64> = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{}\"", table_name))
-        .fetch_one(pool)
-        .await?;
-    
-    match count {
-        Some(c) => Ok(c),
-        None => {
-            eprintln!("⚠ Could not get row count for table {}", table_name);
-            Ok(0)
+async fn upload_to_s3(archive_path: &Path) -> Result<()> {
+    let bucket = match env::var("S3_BUCKET_NAME") {
+        Ok(b) => b,
+        Err(_) => {
+            println!("ℹ S3_BUCKET_NAME not set, skipping S3 upload");
+            return Ok(());
         }
-    }
-}
+    };
 
-/// Serializes database values for SQL output
-fn serialize_value(row: &sqlx::postgres::PgRow, column: &str) -> Result<String> {
-    // First try to get as text representation (works for most types)
-    if let Ok(val) = row.try_get::<Option<String>, _>(column) {
-        return Ok(val.map(|v| {
-            if v.contains('\'') || v.contains('\\') {
-                // Use dollar-quoting for strings with quotes
-                format!("$${}$$", v)
-            } else {
-                format!("'{}'", v)
-            }
-        }).unwrap_or("NULL".to_string()));
+    // Add this check
+    if !archive_path.exists() {
+        return Err(anyhow::anyhow!("Backup file not found at {}", archive_path.display()));
     }
 
-    // Special handling for array types
-    if let Ok(val) = row.try_get::<Option<Vec<String>>, _>(column) {
-        return Ok(val.map(|v| {
-            let elements = v.iter()
-                .map(|s| if s.contains('\'') { format!("$${}$$", s) } else { format!("'{}'", s) })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("ARRAY[{}]", elements)
-        }).unwrap_or("NULL".to_string()));
-    }
-
-    // Handle UUID types
-    if let Ok(val) = row.try_get::<Option<uuid::Uuid>, _>(column) {
-        return Ok(val.map(|v| format!("'{}'", v)).unwrap_or("NULL".to_string()));
-    }
-
-    // Handle all integer types
-    if let Ok(val) = row.try_get::<Option<i8>, _>(column) {
-        return Ok(val.map(|v| v.to_string()).unwrap_or("NULL".to_string()));
-    }
-    if let Ok(val) = row.try_get::<Option<i16>, _>(column) {
-        return Ok(val.map(|v| v.to_string()).unwrap_or("NULL".to_string()));
-    }
-    if let Ok(val) = row.try_get::<Option<i32>, _>(column) {
-        return Ok(val.map(|v| v.to_string()).unwrap_or("NULL".to_string()));
-    }
-    if let Ok(val) = row.try_get::<Option<i64>, _>(column) {
-        return Ok(val.map(|v| v.to_string()).unwrap_or("NULL".to_string()));
-    }
-
-    // Handle all float types
-    if let Ok(val) = row.try_get::<Option<f32>, _>(column) {
-        return Ok(val.map(|v| v.to_string()).unwrap_or("NULL".to_string()));
-    }
-    if let Ok(val) = row.try_get::<Option<f64>, _>(column) {
-        return Ok(val.map(|v| v.to_string()).unwrap_or("NULL".to_string()));
-    }
-
-    // Handle numeric/decimal types using BigDecimal
-    if let Ok(val) = row.try_get::<Option<sqlx::types::BigDecimal>, _>(column) {
-        return Ok(val.map(|v| v.to_string()).unwrap_or("NULL".to_string()));
-    }
-
-    // Handle boolean
-    if let Ok(val) = row.try_get::<Option<bool>, _>(column) {
-        return Ok(val.map(|v| v.to_string()).unwrap_or("NULL".to_string()));
-    }
-
-    // Handle JSON/JSONB
-    if let Ok(val) = row.try_get::<Option<serde_json::Value>, _>(column) {
-        return Ok(val.map(|v| format!("'{}'", v.to_string())).unwrap_or("NULL".to_string()));
-    }
-
-    // Handle timestamps with timezone
-    if let Ok(val) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(column) {
-        return Ok(val.map(|v| format!("'{}'", v.naive_utc())).unwrap_or("NULL".to_string()));
-    }
-
-    // Handle other date/time types
-    if let Ok(val) = row.try_get::<Option<chrono::NaiveDate>, _>(column) {
-        return Ok(val.map(|v| format!("'{}'", v)).unwrap_or("NULL".to_string()));
-    }
-    if let Ok(val) = row.try_get::<Option<chrono::NaiveTime>, _>(column) {
-        return Ok(val.map(|v| format!("'{}'", v)).unwrap_or("NULL".to_string()));
-    }
-    if let Ok(val) = row.try_get::<Option<chrono::NaiveDateTime>, _>(column) {
-        return Ok(val.map(|v| format!("'{}'", v)).unwrap_or("NULL".to_string()));
-    }
-
-    // Fallback to text representation
-    match row.try_get::<Option<String>, _>(column) {
-        Ok(val) => Ok(val.map(|v| format!("'{}'", v.replace("'", "''"))).unwrap_or("NULL".to_string())),
-        Err(_) => Err(anyhow::anyhow!("Unsupported data type for column {}", column)),
-    }
-}
-
-/// Compresses the backup directory into a tar.gz archive
-pub fn compress_backup(backup_dir: &Path) -> Result<()> {
-    let timestamp = backup_dir.file_name()
+    let archive_name = archive_path
+        .file_name()
         .and_then(|n| n.to_str())
-        .context("Invalid backup directory name")?;
-    
-    let archive_name = format!("database_backup_{}.tar.gz", timestamp);
-    let local_backup_dir = env::var("LOCAL_BACKUP_DIR")
-        .unwrap_or(DEFAULT_BACKUP_DIR.to_string());
+        .context("Invalid archive file name")?;
 
-    println!("🗜 Compressing backup to {}/{}", local_backup_dir, archive_name);
+    println!("☁ Uploading {} to S3 bucket: {}", archive_name, bucket);
 
-    let status = Command::new("tar")
-        .args(["-czf", 
-              &format!("{}/{}", local_backup_dir, archive_name), 
-              "-C", TEMP_BACKUP_ROOT, 
-              timestamp])
-        .status()
-        .context("Failed to execute tar command")?;
+    // Add file size info
+    let file_size = fs::metadata(archive_path)?.len();
+    println!("📦 File size: {} bytes", file_size);
 
-    if !status.success() {
-        return Err(anyhow::anyhow!("Failed to compress backup (tar exit code: {})", status));
-    }
+    let region_provider = RegionProviderChain::default_provider().or_else("us-east-1");
+    let config = aws_config::from_env().region(region_provider).load().await;
+    let client = S3Client::new(&config);
 
-    println!("✅ Backup compressed successfully");
+    let body = ByteStream::from_path(archive_path)
+        .await
+        .context(format!("Failed to read backup file: {}", archive_path.display()))?;
+
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_name)
+        .body(body)
+        .send()
+        .await
+        .context("Failed to upload backup to S3")?;
+
+    println!("✅ Uploaded {} to S3 ({} bytes)", archive_name, file_size);
     Ok(())
 }
 
 /// Main backup flow
 pub async fn run_backup_flow() -> Result<()> {
-    println!("🚀 Starting database backup process");
-    println!("🛠 Using backup root: {}", TEMP_BACKUP_ROOT);
-    println!("🛠 Current directory: {:?}", std::env::current_dir()?);
-    println!("🛠 Backup root exists: {}", Path::new(TEMP_BACKUP_ROOT).exists());
 
-    let source_url = env::var("SOURCE_DATABASE_URL")
-        .context("SOURCE_DATABASE_URL must be set")?;
-    
+    println!("🚀 Starting database backup process");
+    println!("🛠 Current directory: {:?}", std::env::current_dir()?);
+
+    let source_url = env::var("SOURCE_DATABASE_URL").context("SOURCE_DATABASE_URL must be set")?;
+
     if !check_db_connection(&source_url).await {
         anyhow::bail!("❌ Cannot proceed with backup - database connection failed");
     }
 
-    let backup_dir = create_backup_dir()?;
-    dump_databases(&backup_dir).await?;
-    compress_backup(&backup_dir)?;
+    let (local_dir, temp_dir) = setup_backup_dirs()?;
+    let backup_dir = create_timestamped_backup_dir(&temp_dir)?;
 
-    println!("\n🎉 Backup completed successfully");
+    dump_databases(&backup_dir).await?;
+
+    let archive_path = store_backup_in_all_locations(&backup_dir, &local_dir, &temp_dir)?;
+
+    upload_to_s3(&archive_path).await?;
+
+    println!("\n🎉 Backup completed and distributed successfully");
     Ok(())
 }

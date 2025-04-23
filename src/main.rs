@@ -51,15 +51,6 @@ async fn run_backup() {
 async fn run_restore() {
     println!("\nStarting Restore...");
     
-    // Get archive path from environment variable
-    let archive_path = env::var("ARCHIVE_FILE_PATH").expect("ARCHIVE_FILE_PATH must be set");
-
-    // Validate archive exists
-    if !Path::new(&archive_path).exists() {
-        println!("❌ Archive file not found at: {}", archive_path);
-        return;
-    }
-
     // Call the restore flow from logic module
-    restore::logic::run_restore_flow(&archive_path).await;
+    restore::logic::run_restore_flow().await;
 }
