@@ -3,8 +3,11 @@ use sqlx::postgres::PgRow;
 use std::fs;
 use std::io::Write;
 use std::env;
-use std::path::PathBuf;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use std::process::Command;
+use std::path::{Path, PathBuf};
+use anyhow::anyhow;
+use anyhow::Context;
 
 pub async fn check_db_connection(db_url: &str) -> bool {
     match PgPoolOptions::new()
@@ -125,4 +128,64 @@ pub fn serialize_value(row: &sqlx::postgres::PgRow, column: &str) -> Result<Stri
         Ok(val) => Ok(val.map(|v| format!("'{}'", v.replace("'", "''"))).unwrap_or("NULL".to_string())),
         Err(_) => Err(anyhow::anyhow!("Unsupported data type for column {}", column)),
     }
+}
+
+pub fn prepare_working_directory(archive_path: &Path) -> Result<PathBuf> {
+    println!("\n📦 Preparing working directory...");
+    println!("- Input path: {}", archive_path.display());
+    println!("- Is tar.gz: {}", is_tar_gz(archive_path));
+    println!("- Is directory: {}", archive_path.is_dir());
+
+    if is_tar_gz(archive_path) {
+        // Extract next to original archive
+        let extract_to = archive_path.parent()
+            .unwrap_or_else(|| Path::new("."));
+
+        println!("🔍 Extracting {} to {}", 
+            archive_path.display(), 
+            extract_to.display());
+
+            let status = Command::new("tar")
+            .arg("-xzf")
+            .arg(archive_path)
+            .arg("-C")
+            .arg(extract_to)
+            .status()
+            .context("❌ Failed to extract archive")?;
+
+        if !status.success() {
+            return Err(anyhow!("❌ tar command failed with exit code {}", status));
+        }
+
+        // Get the expected directory name (removes .tar.gz)
+        let dir_name = archive_path.file_stem()
+            .context("❌ Invalid archive name").unwrap()
+            .to_str()
+            .context("❌ Invalid UTF-8 in archive name").unwrap()
+            .strip_suffix(".tar")
+            .unwrap_or("backup")
+            .strip_prefix("backup_")
+            .unwrap_or("backup");
+            
+        let extracted_dir = extract_to.join(dir_name);
+        println!("ℹ Using extracted files from: {}", extracted_dir.display());
+
+        Ok(extracted_dir)
+
+    } else if archive_path.is_dir() {
+        println!("ℹ Using directory directly: {}", archive_path.display());
+        Ok(archive_path.to_path_buf())
+    } else {
+        Err(anyhow::anyhow!(
+            "Unsupported backup format. Must be .tar.gz file or directory (found: {})",
+            archive_path.display()
+        ))
+    }
+}
+
+fn is_tar_gz(path: &Path) -> bool {
+    path.extension().map_or(false, |ext| ext == "gz") &&
+    path.file_stem().map_or(false, |stem| {
+        stem.to_string_lossy().ends_with(".tar")
+    })
 }
