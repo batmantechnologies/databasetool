@@ -17,6 +17,9 @@ use sqlparser::ast::Statement as SqlStatement;
 use sqlparser::ast::{ColumnOptionDef,ColumnOption,Expr};
 use std::collections::HashSet;
 use std::fmt;
+use anyhow::anyhow;
+use std::process::Command;
+use crate::utils::setting::{prepare_working_directory};
 
 #[derive(Debug, Clone)]
 enum CustomStatement {
@@ -301,7 +304,9 @@ fn separate_statements(statements: &[String]) -> (Vec<String>, Vec<String>) {
 
     (create, others)
 }
+
 pub async fn run_restore_flow() -> Result<(), anyhow::Error> {
+
     let original_url = env::var("TARGET_DATABASE_URL").context("TARGET_DATABASE_URL must be set")?;
     let original_url = if original_url.starts_with("postgres://") || original_url.starts_with("postgresql://") {
         original_url
@@ -317,17 +322,13 @@ pub async fn run_restore_flow() -> Result<(), anyhow::Error> {
 
     // Handle tar.gz files
     if path.extension().map_or(false, |ext| ext == "gz") &&
-       path.file_stem().map_or(false, |stem| stem.to_string_lossy().ends_with(".tar")) {
-        println!("🔍 Detected tar.gz archive, extracting...");
-        
-        let dir = tempdir().context("Failed to create temp directory")?;
-        let file = File::open(path).context("Failed to open archive file")?;
-        let tar = GzDecoder::new(file);
-        let mut archive = Archive::new(tar);
-        
-        archive.unpack(dir.path()).context("Failed to extract archive")?;
-        working_path = dir.path().to_path_buf();
-        temp_dir = Some(dir);
+       path.file_stem().map_or(false, |stem| {
+                   let stem = stem.to_string_lossy();
+                   stem.ends_with(".tar") || stem.ends_with("_tar")
+               }) {
+               println!("🔍 Detected tar archive, extracting...");
+               
+               working_path = prepare_working_directory(&path)?;
     } else {
         working_path = path.to_path_buf();
     }
@@ -392,28 +393,7 @@ pub async fn run_restore_flow() -> Result<(), anyhow::Error> {
             .await
             .expect("Failed to create database pool");
 
-        // Print existing tables in the database
-        println!("\n📋 Existing tables in database:");
-        match sqlx::query_scalar::<_, String>(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
-        )
-        .fetch_all(&pool)
-        .await {
-            Ok(tables) => {
-                if tables.is_empty() {
-                    println!("No tables found in database");
-                } else {
-                    for table in &tables {
-                        println!("- {}", table);
-                    }
-                    println!("Found {} tables", tables.len());
-                }
-            }
-            Err(e) => eprintln!("⚠️ Failed to list tables: {}", e),
-        }
-
         let path = &working_path;
-
         if path.is_dir() {
             println!("📁 Processing directory backup format");
             println!("ℹ Directory contents:");
@@ -543,4 +523,3 @@ async fn create_table_from_insert(query: &str, pool: &PgPool) -> Result<(), sqlx
     sqlx::query(&create_sql).execute(pool).await?;
     Ok(())
 }
-

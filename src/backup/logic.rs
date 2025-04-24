@@ -13,8 +13,11 @@ use crate::utils::setting::{check_db_connection,get_row_count,serialize_value};
 use std::io::Seek;
 use std::io::SeekFrom;
 use aws_config::meta::region::RegionProviderChain;
-use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::primitives::ByteStream;
+use tokio::time::{timeout, Duration};
+use aws_sdk_s3::config::Credentials;
+use aws_sdk_s3::{Client, Config};
+use aws_config::Region;
 
 /// Gets the list of databases to backup from environment variable
 fn get_database_list() -> Result<Vec<String>> {
@@ -28,7 +31,14 @@ fn get_database_list() -> Result<Vec<String>> {
 fn get_local_backup_dir() -> PathBuf {
     // First try environment variable
     if let Ok(dir) = env::var("LOCAL_BACKUP_DIR") {
-        return PathBuf::from(dir);
+        let path = PathBuf::from(dir);
+        if path.is_file() {
+            eprintln!("⚠ LOCAL_BACKUP_DIR points to a file, using parent directory");
+            return path.parent()
+                .unwrap_or_else(|| Path::new("/tmp"))
+                .to_path_buf();
+        }
+        return path;
     }
 
     // Fallback to system temp directory
@@ -43,8 +53,10 @@ fn get_base_url_without_db(full_url: &str) -> Result<String> {
     parsed.set_path("");
     Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
+
 /// Creates all necessary directories for backups
 pub fn setup_backup_dirs() -> Result<(PathBuf, PathBuf), anyhow::Error> {
+    println!("ℹ Setting up backup directories...");
     // 1. Handle LOCAL_BACKUP_DIR (final storage location)
     let local_backup_dir = env::var("LOCAL_BACKUP_DIR")
         .map(PathBuf::from)
@@ -63,15 +75,17 @@ pub fn setup_backup_dirs() -> Result<(PathBuf, PathBuf), anyhow::Error> {
             Ok::<_, anyhow::Error>(default)
         })?;
 
-    // 3. Create directories if they don't exist
-    fs::create_dir_all(&local_backup_dir)
-        .context(format!("Failed to create local backup dir: {}", local_backup_dir.display()))?;
+    // 3. Only create temp directory (local dir may not exist)
+    if !local_backup_dir.exists() {
+        println!("⚠ Local backup directory does not exist: {}", local_backup_dir.display());
+    }
     fs::create_dir_all(&temp_backup_root)
         .context(format!("Failed to create temp working dir: {}", temp_backup_root.display()))?;
 
-    println!("✓ Local backup dir: {}", local_backup_dir.display());
     println!("✓ Temp working dir: {}", temp_backup_root.display());
+    println!("ℹ Local backup dir will be used if exists: {}", local_backup_dir.display());
 
+    println!("✓ Backup directories setup complete");
     Ok((local_backup_dir, temp_backup_root))
 }
 
@@ -99,10 +113,16 @@ pub fn store_backup_in_all_locations(
     );
 
     // 1. Create in local backup dir (primary location)
-    let primary_path = local_dir.join(&archive_name);
+    let primary_path = if local_dir.is_file() {
+        local_dir.parent()
+            .unwrap_or_else(|| Path::new("/tmp"))
+            .join(&archive_name)
+    } else {
+        local_dir.join(&archive_name)
+    };
     create_tar_archive(&backup_dir, &primary_path)?;
 
-    // 2. Copy to temp working dir
+    // // 2. Copy to temp working dir
     let temp_path = temp_dir.join(&archive_name);
     if primary_path != temp_path {
         fs::copy(&primary_path, &temp_path)
@@ -113,6 +133,7 @@ pub fn store_backup_in_all_locations(
 }
 
 fn create_tar_archive(source_dir: &Path, dest_path: &Path) -> Result<(), anyhow::Error> {
+    println!("ℹ Creating tar archive from {} to {}", source_dir.display(), dest_path.display());
     let status = Command::new("tar")
         .args([
             "-czf",
@@ -127,6 +148,7 @@ fn create_tar_archive(source_dir: &Path, dest_path: &Path) -> Result<(), anyhow:
     if !status.success() {
         return Err(anyhow::anyhow!("Tar failed with exit code {}", status));
     }
+    println!("✓ Tar archive created successfully at {}", dest_path.display());
     Ok(())
 }
 
@@ -452,16 +474,20 @@ async fn backup_table_data(pool: &PgPool, file: &mut File) -> Result<()> {
     Ok(())
 }
 
-async fn upload_to_s3(archive_path: &Path) -> Result<()> {
-    let bucket = match env::var("S3_BUCKET_NAME") {
-        Ok(b) => b,
-        Err(_) => {
-            println!("ℹ S3_BUCKET_NAME not set, skipping S3 upload");
-            return Ok(());
-        }
-    };
+/// Uploads backup archive to configured object storage (S3/Spaces compatible).
+/// Requires STORAGE_BUCKET_NAME, ACCESS_KEY_ID and SECRET_ACCESS_KEY env vars.
+/// Returns Ok(()) on success or Err with failure details.
+pub async fn upload_to_object_storage(archive_path: &Path) -> Result<()> {
 
-    // Add this check
+    let bucket = env::var("STORAGE_BUCKET_NAME")
+        .context("STORAGE_BUCKET_NAME must be set")?;
+
+    let access_key = env::var("STORAGE_ACCESS_KEY_ID")
+        .context("STORAGE_ACCESS_KEY_ID must be set")?;
+
+    let secret_key = env::var("STORAGE_SECRET_ACCESS_KEY")
+        .context("STORAGE_SECRET_ACCESS_KEY must be set")?;
+
     if !archive_path.exists() {
         return Err(anyhow::anyhow!("Backup file not found at {}", archive_path.display()));
     }
@@ -471,31 +497,73 @@ async fn upload_to_s3(archive_path: &Path) -> Result<()> {
         .and_then(|n| n.to_str())
         .context("Invalid archive file name")?;
 
-    println!("☁ Uploading {} to S3 bucket: {}", archive_name, bucket);
+    let object_key = match env::var("STORAGE_FOLDER_PREFIX") {
+        Ok(prefix) => format!("{}/{}", prefix.trim_end_matches('/'), archive_name),
+        Err(_) => archive_name.to_string(),
+    };
 
-    // Add file size info
+    println!("☁ Uploading {} to bucket: {}/{}", archive_name, bucket, object_key);
     let file_size = fs::metadata(archive_path)?.len();
     println!("📦 File size: {} bytes", file_size);
 
-    let region_provider = RegionProviderChain::default_provider().or_else("us-east-1");
-    let config = aws_config::from_env().region(region_provider).load().await;
-    let client = S3Client::new(&config);
+    // Region Provider
+    let region = env::var("STORAGE_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+    let region_provider = RegionProviderChain::first_try(Region::new(region.clone()))
+        .or_else(Region::new("us-east-1"));
+
+    // Credentials
+    let credentials = Credentials::new(
+        &access_key,
+        &secret_key,
+        None,
+        None,
+        "manual-credentials"
+    );
+
+    // aws_config::from_env to build full config
+    let mut config_loader = aws_config::from_env()
+        .region(region_provider)
+        .credentials_provider(credentials);
+
+    // If using custom endpoint (e.g. DigitalOcean Spaces)
+    if let Ok(endpoint) = env::var("STORAGE_ENDPOINT_URL") {
+        config_loader = config_loader.endpoint_url(endpoint);
+    }
+
+    // Load config
+    let config = config_loader.load().await;
+
+    // Create S3 client
+    let client = Client::new(&config);
 
     let body = ByteStream::from_path(archive_path)
         .await
-        .context(format!("Failed to read backup file: {}", archive_path.display()))?;
+        .context("Failed to read archive file for upload")?;
 
-    client
+    // Upload with timeout
+    let upload_result = timeout(Duration::from_secs(30), client
         .put_object()
         .bucket(bucket)
-        .key(archive_name)
+        .key(object_key)
         .body(body)
-        .send()
-        .await
-        .context("Failed to upload backup to S3")?;
+        .send()).await;
 
-    println!("✅ Uploaded {} to S3 ({} bytes)", archive_name, file_size);
-    Ok(())
+    match upload_result {
+        Ok(Ok(_)) => {
+            println!("✅ Successfully uploaded {} to object storage", archive_name);
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            let err_msg = format!("❌ Upload failed: {:?}", e);
+            eprintln!("{}", err_msg);
+            Err(anyhow::anyhow!(err_msg))
+        }
+        Err(_) => {
+            let err_msg = "❌ Upload timed out after 30 seconds";
+            eprintln!("{}", err_msg);
+            Err(anyhow::anyhow!(err_msg))
+        }
+    }
 }
 
 /// Main backup flow
@@ -517,8 +585,13 @@ pub async fn run_backup_flow() -> Result<()> {
 
     let archive_path = store_backup_in_all_locations(&backup_dir, &local_dir, &temp_dir)?;
 
-    upload_to_s3(&archive_path).await?;
+    let upload_success =upload_to_object_storage(&archive_path).await;
 
-    println!("\n🎉 Backup completed and distributed successfully");
+    println!("\nℹ Backup process completed");
+    if !upload_success.is_err() {
+        println!("🎉 Backup completed and uploaded successfully");
+    } else {
+        println!("⚠ Backup completed but upload failed - check logs for details");
+    }
     Ok(())
 }
