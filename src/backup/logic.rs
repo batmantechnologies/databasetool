@@ -1,4 +1,3 @@
-use chrono::Local;
 use std::{
     env, fs,
     fs::File,
@@ -6,18 +5,25 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
-use anyhow::{Context, Result};
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use aws_config::{
+    meta::region::RegionProviderChain,
+    retry::RetryConfig,
+    timeout::TimeoutConfig,
+    BehaviorVersion,
+};
 use url::Url;
-use crate::utils::setting::{check_db_connection,get_row_count,serialize_value};
+use chrono::Local;
 use std::io::Seek;
 use std::io::SeekFrom;
-use aws_config::meta::region::RegionProviderChain;
-use aws_sdk_s3::primitives::ByteStream;
-use tokio::time::{timeout, Duration};
-use aws_sdk_s3::config::Credentials;
+use aws_config::{Region};
+use tokio::io::AsyncReadExt;
+use anyhow::{Context, Result};
 use aws_sdk_s3::{Client, Config};
-use aws_config::Region;
+use aws_sdk_s3::config::Credentials;
+use tokio::time::Duration;
+use aws_sdk_s3::primitives::ByteStream;
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use crate::utils::setting::{check_db_connection,get_row_count,serialize_value};
 
 /// Gets the list of databases to backup from environment variable
 fn get_database_list() -> Result<Vec<String>> {
@@ -26,25 +32,6 @@ fn get_database_list() -> Result<Vec<String>> {
         .split(',')
         .map(|s| Ok(s.trim().to_string()))
         .collect()
-}
-
-fn get_local_backup_dir() -> PathBuf {
-    // First try environment variable
-    if let Ok(dir) = env::var("LOCAL_BACKUP_DIR") {
-        let path = PathBuf::from(dir);
-        if path.is_file() {
-            eprintln!("⚠ LOCAL_BACKUP_DIR points to a file, using parent directory");
-            return path.parent()
-                .unwrap_or_else(|| Path::new("/tmp"))
-                .to_path_buf();
-        }
-        return path;
-    }
-
-    // Fallback to system temp directory
-    let mut path = env::temp_dir();
-    path.push("database_backups");
-    path
 }
 
 /// Extracts the base URL without database name
@@ -426,7 +413,6 @@ async fn backup_table_data(pool: &PgPool, file: &mut File) -> Result<()> {
         // Fetch data in batches
         let mut offset = 0;
         const BATCH_SIZE: i64 = 500;
-        let mut total_rows = 0;
         
         loop {
             let query = format!(
@@ -465,7 +451,6 @@ async fn backup_table_data(pool: &PgPool, file: &mut File) -> Result<()> {
                 }
             }
 
-            total_rows += rows.len();
             offset += BATCH_SIZE;
         }
 
@@ -478,92 +463,150 @@ async fn backup_table_data(pool: &PgPool, file: &mut File) -> Result<()> {
 /// Requires STORAGE_BUCKET_NAME, ACCESS_KEY_ID and SECRET_ACCESS_KEY env vars.
 /// Returns Ok(()) on success or Err with failure details.
 pub async fn upload_to_object_storage(archive_path: &Path) -> Result<()> {
+    // 1. Validate environment variables
+    let bucket = env::var("STORAGE_BUCKET_NAME").context("Missing STORAGE_BUCKET_NAME")?;
+    let access_key = env::var("STORAGE_ACCESS_KEY_ID").context("Missing STORAGE_ACCESS_KEY_ID")?;
+    let secret_key = env::var("STORAGE_SECRET_ACCESS_KEY").context("Missing STORAGE_SECRET_ACCESS_KEY")?;
 
-    let bucket = env::var("STORAGE_BUCKET_NAME")
-        .context("STORAGE_BUCKET_NAME must be set")?;
-
-    let access_key = env::var("STORAGE_ACCESS_KEY_ID")
-        .context("STORAGE_ACCESS_KEY_ID must be set")?;
-
-    let secret_key = env::var("STORAGE_SECRET_ACCESS_KEY")
-        .context("STORAGE_SECRET_ACCESS_KEY must be set")?;
-
-    if !archive_path.exists() {
-        return Err(anyhow::anyhow!("Backup file not found at {}", archive_path.display()));
+    // 2. Validate file using async version
+    if !tokio::fs::metadata(archive_path).await.is_ok() {
+        return Err(anyhow::anyhow!("File not found at {}", archive_path.display()));
     }
 
-    let archive_name = archive_path
-        .file_name()
+    let file_name = archive_path.file_name()
         .and_then(|n| n.to_str())
-        .context("Invalid archive file name")?;
+        .context("Invalid filename")?;
+    
+    let metadata = tokio::fs::metadata(archive_path).await?;
+    let file_size = metadata.len();
+    println!("📦 Preparing to upload {} ({} bytes)", file_name, file_size);
 
-    let object_key = match env::var("STORAGE_FOLDER_PREFIX") {
-        Ok(prefix) => format!("{}/{}", prefix.trim_end_matches('/'), archive_name),
-        Err(_) => archive_name.to_string(),
-    };
-
-    println!("☁ Uploading {} to bucket: {}/{}", archive_name, bucket, object_key);
-    let file_size = fs::metadata(archive_path)?.len();
-    println!("📦 File size: {} bytes", file_size);
-
-    // Region Provider
+    // 3. Configure AWS client
     let region = env::var("STORAGE_REGION").unwrap_or_else(|_| "us-east-1".to_string());
-    let region_provider = RegionProviderChain::first_try(Region::new(region.clone()))
-        .or_else(Region::new("us-east-1"));
-
-    // Credentials
+    let endpoint_override = env::var("STORAGE_ENDPOINT_URL").ok();
+    
     let credentials = Credentials::new(
-        &access_key,
-        &secret_key,
+        access_key,
+        secret_key,
         None,
         None,
-        "manual-credentials"
+        "manual-credentials",
     );
 
-    // aws_config::from_env to build full config
-    let mut config_loader = aws_config::from_env()
-        .region(region_provider)
-        .credentials_provider(credentials);
+    let timeout_config = TimeoutConfig::builder()
+        .connect_timeout(Duration::from_secs(60))
+        .read_timeout(Duration::from_secs(300))
+        .build();
 
-    // If using custom endpoint (e.g. DigitalOcean Spaces)
-    if let Ok(endpoint) = env::var("STORAGE_ENDPOINT_URL") {
-        config_loader = config_loader.endpoint_url(endpoint);
+    let retry_config = RetryConfig::standard()
+        .with_max_attempts(5)
+        .with_initial_backoff(Duration::from_secs(2));
+
+    let mut config_builder = Config::builder()
+        .behavior_version(BehaviorVersion::v2023_11_09())
+        .region(Region::new(region))
+        .credentials_provider(credentials)
+        .retry_config(retry_config)
+        .timeout_config(timeout_config);
+
+    if let Some(endpoint) = endpoint_override {
+        if !endpoint.trim().is_empty() {
+            config_builder = config_builder.endpoint_url(endpoint);
+        }
     }
 
-    // Load config
-    let config = config_loader.load().await;
+    let config = config_builder.build();
+    let client = Client::from_conf(config);
 
-    // Create S3 client
-    let client = Client::new(&config);
+    // 4. Execute upload with proper async file handling
+    println!("🚀 Beginning upload...");
+    
+    // Open file with tokio's async File
+    let mut file = tokio::fs::File::open(archive_path).await?;
+    let mut buffer = tokio_util::bytes::BytesMut::with_capacity(1024 * 1024); // 1MB buffer
+    
+    // Verify we can read the file
+    let mut total_read = 0;
+    loop {
+        let read = file.read_buf(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        total_read += read;
+        println!("🔹 Verified {} bytes (total: {})", read, total_read);
+        buffer.clear();
+    }
 
-    let body = ByteStream::from_path(archive_path)
-        .await
-        .context("Failed to read archive file for upload")?;
+    // Reset file position to beginning
+    file = tokio::fs::File::open(archive_path).await?;
 
-    // Upload with timeout
-    let upload_result = timeout(Duration::from_secs(30), client
+    // Perform the actual upload
+    let body = ByteStream::from_path(archive_path).await
+        .context("Failed to create ByteStream from file")?;
+
+    // Execute upload
+    match client
         .put_object()
-        .bucket(bucket)
-        .key(object_key)
+        .bucket(&bucket)
+        .key(file_name)
         .body(body)
-        .send()).await;
-
-    match upload_result {
-        Ok(Ok(_)) => {
-            println!("✅ Successfully uploaded {} to object storage", archive_name);
+        .send()
+        .await
+    {
+        Ok(_) => {
+            println!("✅ Successfully uploaded {} to object storage", file_name);
             Ok(())
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             let err_msg = format!("❌ Upload failed: {:?}", e);
             eprintln!("{}", err_msg);
             Err(anyhow::anyhow!(err_msg))
         }
-        Err(_) => {
-            let err_msg = "❌ Upload timed out after 30 seconds";
-            eprintln!("{}", err_msg);
-            Err(anyhow::anyhow!(err_msg))
+    }
+}
+
+/// Verifies required AWS credentials (access key and secret) are present in environment variables.
+pub async fn check_aws_cred() -> Result<()> {
+
+    println!("🔍 Checking AWS credential configuration...");
+
+    let access_key = env::var("STORAGE_ACCESS_KEY_ID")?;
+    let secret_key = env::var("STORAGE_SECRET_ACCESS_KEY")?;
+    let region = env::var("STORAGE_REGION").unwrap_or_else(|_| "us-east-1".into());
+
+    let region_provider = RegionProviderChain::first_try(Region::new(region.clone()));
+
+    let creds = Credentials::new(
+        access_key,
+        secret_key,
+        None,
+        None,
+        "manual-credentials",
+    );
+
+    let config_loader = aws_config::from_env()
+        .region(region_provider)
+        .credentials_provider(creds);
+
+    let sdk_config = config_loader.load().await;
+
+    // Set the behavior version explicitly
+    let config = aws_sdk_s3::config::Builder::from(&sdk_config)
+        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+        .build();
+
+    let client = Client::from_conf(config);
+
+    // Try listing buckets
+    match client.list_buckets().send().await {
+        Ok(_) => {
+            println!("✅ Connected successfully! Buckets:");
+        }
+        Err(err) => {
+            println!("❌ Failed to list buckets: {:?}", err);
         }
     }
+    Ok(())
 }
 
 /// Main backup flow
@@ -585,13 +628,20 @@ pub async fn run_backup_flow() -> Result<()> {
 
     let archive_path = store_backup_in_all_locations(&backup_dir, &local_dir, &temp_dir)?;
 
-    let upload_success =upload_to_object_storage(&archive_path).await;
+    // Only attempt upload if AWS_BUCKET_NAME is set
+    if std::env::var("STORAGE_BUCKET_NAME").is_ok() {
+        let _ = check_aws_cred().await;
+        let upload_success = upload_to_object_storage(&archive_path).await;
 
-    println!("\nℹ Backup process completed");
-    if !upload_success.is_err() {
-        println!("🎉 Backup completed and uploaded successfully");
+        println!("\nℹ Backup process completed");
+        if !upload_success.is_err() {
+            println!("🎉 Backup completed and uploaded successfully");
+        } else {
+            println!("⚠ Backup completed but upload failed - check logs for details");
+        }
     } else {
-        println!("⚠ Backup completed but upload failed - check logs for details");
+        println!("\nℹ Backup process completed (no upload attempted - AWS_BUCKET_NAME not set)");
     }
+    
     Ok(())
 }

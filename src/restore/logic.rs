@@ -1,44 +1,11 @@
-use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::fs::File;
-use std::io::{BufReader, BufRead};
-use flate2::read::GzDecoder;
-use tar::Archive;
-use tempfile::tempdir;
-use sqlx::{PgPool, Executor, Error};
-use sqlx::postgres::PgPoolOptions;
+use std::env;
 use url::Url;
-use regex::Regex;
+use sqlx::PgPool;
 use anyhow::{Result, Context};
-use sqlparser::dialect::PostgreSqlDialect;
-use sqlparser::parser::Parser;
-use sqlparser::ast::Statement as SqlStatement;
-use sqlparser::ast::{ColumnOptionDef,ColumnOption,Expr};
-use std::collections::HashSet;
-use std::fmt;
-use anyhow::anyhow;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use sqlx::postgres::PgPoolOptions;
 use crate::utils::setting::{prepare_working_directory};
-
-#[derive(Debug, Clone)]
-enum CustomStatement {
-    Parsed(SqlStatement),
-    SkippedFunction(String),
-    SkippedConstraint(String),
-    Unparsed(String),
-}
-
-impl fmt::Display for CustomStatement {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CustomStatement::Parsed(stmt) => write!(f, "{}", stmt),
-            CustomStatement::SkippedFunction(sql) => write!(f, "{}", sql),
-            CustomStatement::SkippedConstraint(sql) => write!(f, "{}", sql),
-            CustomStatement::Unparsed(sql) => write!(f, "{}", sql),
-        }
-    }
-}
 
 pub async fn restore_schema(pool: &PgPool, schema_path: &str) -> Result<()> {
     let schema_content = fs::read_to_string(schema_path)
@@ -288,22 +255,6 @@ fn split_sql_with_dollar_quotes(sql: &str) -> Vec<String> {
     final_statements
 }
 
-fn separate_statements(statements: &[String]) -> (Vec<String>, Vec<String>) {
-    let create_table_re = Regex::new(r"(?i)^CREATE\s+TABLE").unwrap();
-
-    let mut create = vec![];
-    let mut others = vec![];
-
-    for stmt in statements {
-        if create_table_re.is_match(stmt.trim_start()) {
-            create.push(stmt.clone());
-        } else {
-            others.push(stmt.clone());
-        }
-    }
-
-    (create, others)
-}
 
 pub async fn run_restore_flow() -> Result<(), anyhow::Error> {
 
@@ -317,7 +268,6 @@ pub async fn run_restore_flow() -> Result<(), anyhow::Error> {
     let archive_path = env::var("ARCHIVE_FILE_PATH").context("ARCHIVE_FILE_PATH must be set")?;
     
     let path = Path::new(&archive_path);
-    let mut temp_dir: Option<tempfile::TempDir> = None;
     let working_path: PathBuf;
 
     // Handle tar.gz files
@@ -485,16 +435,6 @@ fn extract_table_name(query: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-async fn check_table_exists(pool: &PgPool, table_name: &str) -> Result<bool, sqlx::Error> {
-    let query = format!(
-        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{}')",
-        table_name
-    );
-    sqlx::query_scalar::<_, bool>(&query)
-        .fetch_one(pool)
-        .await
 }
 
 async fn create_table_from_insert(query: &str, pool: &PgPool) -> Result<(), sqlx::Error> {
