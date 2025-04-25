@@ -1,13 +1,9 @@
+use anyhow::anyhow;
 use anyhow::Result;
-use sqlx::postgres::PgRow;
-use std::fs;
-use std::io::Write;
-use std::env;
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use anyhow::Context;
 use std::process::Command;
 use std::path::{Path, PathBuf};
-use anyhow::anyhow;
-use anyhow::Context;
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
 pub async fn check_db_connection(db_url: &str) -> bool {
     match PgPoolOptions::new()

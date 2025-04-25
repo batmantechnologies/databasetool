@@ -1,12 +1,9 @@
 // src/main.rs
-use std::path::Path;
 mod utils;
 mod backup;
 mod restore;
 use dotenv::dotenv;
 use std::env;
-use backup::logic::run_backup_flow;
-use restore::logic::run_restore_flow;
 
 #[tokio::main]
 async fn main() {
@@ -45,7 +42,7 @@ fn prompt_choice() -> String {
 async fn run_backup() {
     println!("\nStarting Backup...");
 
-    run_backup_flow().await;
+    backup::logic::run_backup_flow().await;
 }
 
 async fn run_restore() {
