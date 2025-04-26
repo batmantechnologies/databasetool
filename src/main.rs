@@ -1,10 +1,14 @@
-// src/main.rs
+//! Database Backup/Restore Tool
+//!
+//! Provides CLI interface for database backup and restore operations
+
 mod utils;
 mod backup;
 mod restore;
 use dotenv::dotenv;
 use std::env;
 
+/// Main entry point for the backup/restore tool
 #[tokio::main]
 async fn main() {
     dotenv().ok();
@@ -24,6 +28,9 @@ async fn main() {
     }
 }
 
+/// Prompts user to select backup or restore operation
+///
+/// Returns the user's choice as String ("1" or "2")
 fn prompt_choice() -> String {
     use std::io::{stdin, stdout, Write};
 
@@ -39,15 +46,19 @@ fn prompt_choice() -> String {
 }
 
 
+/// Runs the backup workflow
 async fn run_backup() {
-    println!("\nStarting Backup...");
+    println!("\n🚀 Starting Backup Process...");
 
-    backup::logic::run_backup_flow().await;
+    let backup = backup::logic::run_backup_flow().await;
+    backup.unwrap();
 }
 
+/// Runs the restore workflow
 async fn run_restore() {
-    println!("\nStarting Restore...");
+    println!("\n🔄 Starting Restore Process...");
     
     // Call the restore flow from logic module
-    restore::logic::run_restore_flow().await;
+    let restore = restore::logic::run_restore_flow().await;
+    restore.unwrap()
 }

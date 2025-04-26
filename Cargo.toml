@@ -23,3 +23,4 @@ tempfile = "3.8"
 aws-smithy-types = "0.55"
 tokio-util = { version = "0.7", features = ["io"] }
 aws-sdk-s3 = { version = "1.82.0", features = ["behavior-version-latest"] }
+hex = "0.4"
