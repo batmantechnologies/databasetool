@@ -23,7 +23,7 @@ use aws_sdk_s3::config::Credentials;
 use tokio::time::Duration;
 use aws_sdk_s3::primitives::ByteStream;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-use crate::utils::setting::{check_db_connection,get_row_count,serialize_value};
+use crate::utils::setting::{self,check_db_connection,get_row_count,serialize_value};
 
 /// Gets the list of databases to backup from environment variable
 fn get_database_list() -> Result<Vec<String>> {
@@ -39,41 +39,6 @@ fn get_base_url_without_db(full_url: &str) -> Result<String> {
     let mut parsed = Url::parse(full_url).context("Invalid PostgreSQL URL")?;
     parsed.set_path("");
     Ok(parsed.as_str().trim_end_matches('/').to_string())
-}
-
-/// Creates all necessary directories for backups
-pub fn setup_backup_dirs() -> Result<(PathBuf, PathBuf), anyhow::Error> {
-    println!("ℹ Setting up backup directories...");
-    // 1. Handle LOCAL_BACKUP_DIR (final storage location)
-    let local_backup_dir = env::var("LOCAL_BACKUP_DIR")
-        .map(PathBuf::from)
-        .or_else(|_| {
-            let default = PathBuf::from("./backups");
-            println!("ℹ LOCAL_BACKUP_DIR not set, using default: {}", default.display());
-            Ok::<_, anyhow::Error>(default)
-        })?;
-
-    // 2. Handle TEMP_BACKUP_ROOT (working directory)
-    let temp_backup_root = env::var("TEMP_BACKUP_ROOT")
-        .map(PathBuf::from)
-        .or_else(|_| {
-            let default = PathBuf::from("./temp_backups");
-            println!("ℹ TEMP_BACKUP_ROOT not set, using default: {}", default.display());
-            Ok::<_, anyhow::Error>(default)
-        })?;
-
-    // 3. Only create temp directory (local dir may not exist)
-    if !local_backup_dir.exists() {
-        println!("⚠ Local backup directory does not exist: {}", local_backup_dir.display());
-    }
-    fs::create_dir_all(&temp_backup_root)
-        .context(format!("Failed to create temp working dir: {}", temp_backup_root.display()))?;
-
-    println!("✓ Temp working dir: {}", temp_backup_root.display());
-    println!("ℹ Local backup dir will be used if exists: {}", local_backup_dir.display());
-
-    println!("✓ Backup directories setup complete");
-    Ok((local_backup_dir, temp_backup_root))
 }
 
 /// Creates timestamped backup directory inside the temp working dir
@@ -621,27 +586,32 @@ pub async fn run_backup_flow() -> Result<()> {
         anyhow::bail!("❌ Cannot proceed with backup - database connection failed");
     }
 
-    let (local_dir, temp_dir) = setup_backup_dirs()?;
+    let (local_dir, temp_dir) =setting::setup_backup_dirs()?;
     let backup_dir = create_timestamped_backup_dir(&temp_dir)?;
 
     dump_databases(&backup_dir).await?;
 
     let archive_path = store_backup_in_all_locations(&backup_dir, &local_dir, &temp_dir)?;
-
     // Only attempt upload if AWS_BUCKET_NAME is set
-    if std::env::var("STORAGE_BUCKET_NAME").is_ok() {
+    if let Ok(bucket_name) = std::env::var("STORAGE_BUCKET_NAME") {
+
+        if !bucket_name.is_empty() {
         let _ = check_aws_cred().await;
         let upload_success = upload_to_object_storage(&archive_path).await;
 
-        println!("\nℹ Backup process completed");
         if !upload_success.is_err() {
             println!("🎉 Backup completed and uploaded successfully");
         } else {
             println!("⚠ Backup completed but upload failed - check logs for details");
         }
+        } else{
+            println!("⚠ Backup process completed");
+        }
+        
     } else {
-        println!("\nℹ Backup process completed (no upload attempted - AWS_BUCKET_NAME not set)");
+        println!("\nℹ Backup process completed (no upload attempted - STORAGE_BUCKET_NAME not set or empty)");
     }
     
     Ok(())
 }
+
