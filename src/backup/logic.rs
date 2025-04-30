@@ -25,13 +25,23 @@ use aws_sdk_s3::primitives::ByteStream;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use crate::utils::setting::{self,check_db_connection,get_row_count,serialize_value};
 
+
 /// Gets the list of databases to backup from environment variable
 fn get_database_list() -> Result<Vec<String>> {
-    env::var("DATABASE_LIST")
-        .context("DATABASE_LIST must be set")?
-        .split(',')
-        .map(|s| Ok(s.trim().to_string()))
-        .collect()
+    let list_str = env::var("DATABASE_LIST").context("DATABASE_LIST must be set")?;
+
+    println!(" ----------- 0 -------------");
+    println!("Databases to backup: {:?}", list_str);
+    println!(" ----------- 2 -------------");
+
+    let databases = list_str.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+
+    println!("Databases to backup: {:?}", databases);
+    Ok(databases)
 }
 
 /// Extracts the base URL without database name
@@ -109,7 +119,7 @@ pub async fn dump_databases(backup_dir: &Path) -> Result<()> {
     // Ensure backup directory exists
     fs::create_dir_all(backup_dir)
         .context(format!("Failed to create backup directory: {}", backup_dir.display()))?;
-    
+
     let source_url = env::var("SOURCE_DATABASE_URL")
         .context("SOURCE_DATABASE_URL must be set")?;
     let databases = get_database_list()?;
@@ -120,13 +130,13 @@ pub async fn dump_databases(backup_dir: &Path) -> Result<()> {
 
     for db in databases {
         println!("🔍 Backing up database: {}", db);
-        
+
         // Create schema file
         let schema_filename = format!("{}/{}_{}_schema.sql", backup_dir.display(), db, timestamp);
         let schema_path = Path::new(&schema_filename);
         let mut schema_file = File::create(schema_path)
             .context(format!("Failed to create schema file: {}", schema_path.display()))?;
-        
+
         // Create data file
         let data_filename = format!("{}/{}_{}_data.sql", backup_dir.display(), db, timestamp);
         let data_path = Path::new(&data_filename);
@@ -175,8 +185,8 @@ pub async fn dump_databases(backup_dir: &Path) -> Result<()> {
 async fn backup_schema(pool: &PgPool, file: &mut File) -> Result<()> {
     // Phase 1: Basic table structure (no constraints)
     let table_rows = sqlx::query(
-        "SELECT table_name FROM information_schema.tables 
-         WHERE table_schema = 'public' AND table_type = 'BASE TABLE' 
+        "SELECT table_name FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
          ORDER BY table_name"
     )
     .fetch_all(pool)
@@ -184,7 +194,7 @@ async fn backup_schema(pool: &PgPool, file: &mut File) -> Result<()> {
     .context("Failed to fetch Tables")?;
 
     writeln!(file, "-- PHASE 1: BASIC TABLE STRUCTURES")?;
-    
+
     for row in &table_rows {
         let table_name: String = row.get("table_name");
 
@@ -232,7 +242,7 @@ async fn backup_schema(pool: &PgPool, file: &mut File) -> Result<()> {
     // Phase 2: Sequences (needed before data insertion)
     writeln!(file, "\n-- PHASE 2: SEQUENCES")?;
     let sequences = sqlx::query(
-        "SELECT sequence_name FROM information_schema.sequences 
+        "SELECT sequence_name FROM information_schema.sequences
          WHERE sequence_schema = 'public'"
     )
     .fetch_all(pool)
@@ -247,7 +257,7 @@ async fn backup_schema(pool: &PgPool, file: &mut File) -> Result<()> {
 
     // Phase 4: Constraints and indexes (after data is loaded)
     writeln!(file, "\n-- PHASE 4: CONSTRAINTS AND INDEXES")?;
-    
+
     for row in &table_rows {
         let table_name: String = row.get("table_name");
 
@@ -315,7 +325,7 @@ async fn backup_schema(pool: &PgPool, file: &mut File) -> Result<()> {
 
     // Phase 5: Other schema objects
     writeln!(file, "\n-- PHASE 5: OTHER SCHEMA OBJECTS")?;
-    
+
     let other_objects = [
         // Skip functions and triggers - only backup views
         ("Views", "SELECT definition AS def FROM pg_views WHERE schemaname = 'public'")
@@ -323,7 +333,7 @@ async fn backup_schema(pool: &PgPool, file: &mut File) -> Result<()> {
 
     for (obj_type, query) in other_objects {
         writeln!(file, "\n-- {} definitions", obj_type)?;
-        
+
         let rows = sqlx::query(query)
             .fetch_all(pool)
             .await
@@ -351,7 +361,7 @@ async fn backup_table_data(pool: &PgPool, file: &mut File) -> Result<()> {
 
     for table in tables {
         let table_name: String = table.get("table_name");
-        
+
         let columns = sqlx::query(
             "SELECT column_name, data_type, udt_name
              FROM information_schema.columns
@@ -378,13 +388,13 @@ async fn backup_table_data(pool: &PgPool, file: &mut File) -> Result<()> {
         // Fetch data in batches
         let mut offset = 0;
         const BATCH_SIZE: i64 = 500;
-        
+
         loop {
             let query = format!(
                 "SELECT * FROM \"{}\" ORDER BY 1 LIMIT {} OFFSET {}",
                 table_name, BATCH_SIZE, offset
             );
-            
+
             let rows = match sqlx::query(&query).fetch_all(pool).await {
                 Ok(rows) => rows,
                 Err(e) => {
@@ -441,7 +451,7 @@ pub async fn upload_to_object_storage(archive_path: &Path) -> Result<()> {
     let file_name = archive_path.file_name()
         .and_then(|n| n.to_str())
         .context("Invalid filename")?;
-    
+
     let metadata = tokio::fs::metadata(archive_path).await?;
     let file_size = metadata.len();
     println!("📦 Preparing to upload {} ({} bytes)", file_name, file_size);
@@ -449,7 +459,7 @@ pub async fn upload_to_object_storage(archive_path: &Path) -> Result<()> {
     // 3. Configure AWS client
     let region = env::var("STORAGE_REGION").unwrap_or_else(|_| "us-east-1".to_string());
     let endpoint_override = env::var("STORAGE_ENDPOINT_URL").ok();
-    
+
     let credentials = Credentials::new(
         access_key,
         secret_key,
@@ -485,11 +495,11 @@ pub async fn upload_to_object_storage(archive_path: &Path) -> Result<()> {
 
     // 4. Execute upload with proper async file handling
     println!("🚀 Beginning upload...");
-    
+
     // Open file with tokio's async File
     let mut file = tokio::fs::File::open(archive_path).await?;
     let mut buffer = tokio_util::bytes::BytesMut::with_capacity(1024 * 1024); // 1MB buffer
-    
+
     // Verify we can read the file
     let mut total_read = 0;
     loop {
@@ -607,11 +617,10 @@ pub async fn run_backup_flow() -> Result<()> {
         } else{
             println!("⚠ Backup process completed");
         }
-        
+
     } else {
         println!("\nℹ Backup process completed (no upload attempted - STORAGE_BUCKET_NAME not set or empty)");
     }
-    
+
     Ok(())
 }
-

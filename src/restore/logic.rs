@@ -17,7 +17,7 @@ pub async fn restore_schema(pool: &PgPool, schema_path: &str) -> Result<()> {
     // Separate statements into sequences, tables, and others
     let (sequences, rest): (Vec<_>, Vec<_>) = statements.into_iter()
         .partition(|stmt| stmt.contains("CREATE SEQUENCE"));
-    
+
     let (tables, others): (Vec<_>, Vec<_>) = rest.into_iter()
         .partition(|stmt| stmt.contains("CREATE TABLE"));
 
@@ -123,7 +123,7 @@ pub async fn restore_from_sql_file(pool: &PgPool, sql_path: &str) -> Result<()> 
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
                 .collect();
-            
+
             for cmd in commands {
                 if let Err(e) = sqlx::query(cmd).execute(pool).await {
                     // Handle missing tables for INSERT statements
@@ -161,7 +161,7 @@ fn split_sql_with_dollar_quotes(sql: &str) -> Vec<String> {
 
     for line in sql.lines() {
         let mut chars = line.chars().peekable();
-        
+
         while let Some(c) = chars.next() {
             // Handle line comments
             if !in_dollar_quote && !in_single_quote && c == '-' && chars.peek() == Some(&'-') {
@@ -212,7 +212,7 @@ fn split_sql_with_dollar_quotes(sql: &str) -> Vec<String> {
             }
             current.push(c);
         }
-        
+
         if !in_comment && !in_dollar_quote {
             current.push('\n');
         }
@@ -266,8 +266,21 @@ pub async fn run_restore_flow() -> Result<(), anyhow::Error> {
     };
     let db_names = env::var("DATABASE_LIST").context("DATABASE_LIST must be set")?;
     let archive_path = env::var("ARCHIVE_FILE_PATH").context("ARCHIVE_FILE_PATH must be set")?;
-    
+
+    // Validate that the archive path is not empty
+    if archive_path.trim().is_empty() {
+        return Err(anyhow::anyhow!("ARCHIVE_FILE_PATH is empty"));
+    }
+
     let path = Path::new(&archive_path);
+
+    // Check if file/directory exists
+    if !path.exists() {
+        return Err(anyhow::anyhow!("Archive path does not exist: {}", path.display()));
+    }
+
+    println!("📂 Using archive path: {}", path.display());
+
     let working_path: PathBuf;
 
     // Handle tar.gz files
@@ -277,21 +290,37 @@ pub async fn run_restore_flow() -> Result<(), anyhow::Error> {
                    stem.ends_with(".tar") || stem.ends_with("_tar")
                }) {
                println!("🔍 Detected tar archive, extracting...");
-               
+
                working_path = prepare_working_directory(&path)?;
     } else {
         working_path = path.to_path_buf();
     }
 
     println!("ℹ Using backup path: {}", working_path.display());
+
+    // Show directory contents for debugging
+    if working_path.is_dir() {
+        println!("📁 Directory contents:");
+        match fs::read_dir(&working_path) {
+            Ok(entries) => {
+                for entry in entries {
+                    if let Ok(entry) = entry {
+                        println!("  - {}", entry.path().display());
+                    }
+                }
+            },
+            Err(e) => println!("⚠️ Could not read directory: {}", e),
+        }
+    }
+
     // Process each database in the comma-separated list
     for db_name in db_names.split(',').map(|s| s.trim()) {
         let restored_db_name = format!("{}_restored", db_name);
-        
+
         // Create admin connection to postgres database
         let mut admin_url = Url::parse(&original_url).context("Invalid database URL - must be in format postgres://user:password@host:port/database")?;
         admin_url.set_path("/postgres");
-        
+
         let admin_pool = PgPoolOptions::new()
             .max_connections(1)
             .connect(&admin_url.to_string())
@@ -335,7 +364,7 @@ pub async fn run_restore_flow() -> Result<(), anyhow::Error> {
             .trim_start_matches('/')
             .to_string();
         println!("🔌 Connecting to target database: {}", target_db);
-        
+
         // Create pool connection for our target DB
         let pool = PgPoolOptions::new()
             .max_connections(5)
@@ -355,7 +384,7 @@ pub async fn run_restore_flow() -> Result<(), anyhow::Error> {
             let timestamp = path.file_name()
                 .and_then(|n| n.to_str())
                 .context("Invalid backup directory name - should be in format YYYYMMDD_HHMMSS")?;
-            
+
             println!("ℹ Extracted timestamp from directory name: {}", timestamp);
 
             println!("🔍 Looking for backup files in: {}", path.display());
@@ -441,25 +470,25 @@ async fn create_table_from_insert(query: &str, pool: &PgPool) -> Result<(), sqlx
     eprintln!("Creating table from INSERT statement");
     let table_name = extract_table_name(query)
         .ok_or(sqlx::Error::Protocol("Could not extract table name".into()))?;
-    
+
     // Extract column names from INSERT statement
     let cols_start = query.find('(')
         .ok_or(sqlx::Error::Protocol("Could not find column list".into()))? + 1;
     let cols_end = query[cols_start..].find(')')
         .ok_or(sqlx::Error::Protocol("Could not find column list end".into()))?;
     let cols_str = &query[cols_start..cols_start + cols_end];
-    
+
     let columns: Vec<&str> = cols_str.split(',')
         .map(|s| s.trim().trim_matches('"'))
         .collect();
-    
+
     // Create table with TEXT columns by default (simplest approach)
     let create_sql = format!(
         "CREATE TABLE IF NOT EXISTS \"{}\" ({})",
         table_name,
         columns.iter().map(|c| format!("\"{}\" TEXT", c)).collect::<Vec<_>>().join(", ")
     );
-    
+
     sqlx::query(&create_sql).execute(pool).await?;
     Ok(())
 }

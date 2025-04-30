@@ -31,7 +31,7 @@ pub async fn get_row_count(pool: &PgPool, table_name: &str) -> Result<i64> {
     let count: Option<i64> = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{}\"", table_name))
         .fetch_one(pool)
         .await?;
-    
+
     match count {
         Some(c) => Ok(c),
         None => {
@@ -57,7 +57,7 @@ pub fn serialize_value(row: &PgRow, column: &str) -> Result<String> {
     // 2. Handle integer arrays (for user_ids, class_ids, notify_type)
     if let Ok(val) = row.try_get::<Option<Vec<i32>>, _>(column) {
         return Ok(val.map(|v| {
-            format!("ARRAY[{}]", 
+            format!("ARRAY[{}]",
                 v.iter()
                  .map(|n| n.to_string())
                  .collect::<Vec<_>>()
@@ -88,7 +88,7 @@ pub fn serialize_value(row: &PgRow, column: &str) -> Result<String> {
     // 5. Handle UUID arrays
     if let Ok(val) = row.try_get::<Option<Vec<uuid::Uuid>>, _>(column) {
         return Ok(val.map(|v| {
-            format!("ARRAY[{}]", 
+            format!("ARRAY[{}]",
                 v.iter()
                  .map(|u| format!("'{}'", u))
                  .collect::<Vec<_>>()
@@ -139,6 +139,25 @@ pub fn serialize_value(row: &PgRow, column: &str) -> Result<String> {
         return Ok(val.map(|v| format!("'{}'", v.naive_utc())).unwrap_or("NULL".to_string()));
     }
 
+    // Handle date type (for DATE columns like dob)
+    if let Ok(val) = row.try_get::<Option<chrono::NaiveDate>, _>(column) {
+        return Ok(val.map(|v| format!("'{}'", v)).unwrap_or("NULL".to_string()));
+    }
+
+    // Handle time type (for TIME columns)
+    if let Ok(val) = row.try_get::<Option<chrono::NaiveTime>, _>(column) {
+        return Ok(val.map(|v| format!("'{}'", v)).unwrap_or("NULL".to_string()));
+    }
+
+    // Handle interval type
+    if let Ok(val) = row.try_get::<Option<sqlx::postgres::types::PgInterval>, _>(column) {
+        return Ok(val.map(|v| format!("'{} seconds {}{} days'::interval",
+                            v.microseconds as f64 / 1_000_000.0,
+                            if v.months != 0 { format!("{} months ", v.months) } else { "".to_string() },
+                            if v.days != 0 { format!("{}", v.days) } else { "0".to_string() }
+                        )).unwrap_or("NULL".to_string()));
+    }
+
     // 12. Handle binary data (bytea)
     if let Ok(val) = row.try_get::<Option<Vec<u8>>, _>(column) {
         return Ok(val.map(|v| format!("E'\\\\x{}'", hex::encode(v)))
@@ -149,7 +168,7 @@ pub fn serialize_value(row: &PgRow, column: &str) -> Result<String> {
     match row.try_get::<Option<String>, _>(column) {
         Ok(val) => Ok(val.map(|v| format!("'{}'", v.replace("'", "''")))
                      .unwrap_or("NULL".to_string())),
-        Err(_) => Err(anyhow!("Unsupported data type for column {}", column)),
+        Err(_) => Err(anyhow!("Unsupported data type for column {} (table possibly contains DATE, TIME, or other unsupported types)", column)),
     }
 }
 
@@ -164,8 +183,8 @@ pub fn prepare_working_directory(archive_path: &Path) -> Result<PathBuf> {
         let extract_to = archive_path.parent()
             .unwrap_or_else(|| Path::new("."));
 
-        println!("🔍 Extracting {} to {}", 
-            archive_path.display(), 
+        println!("🔍 Extracting {} to {}",
+            archive_path.display(),
             extract_to.display());
 
             let status = Command::new("tar")
@@ -189,7 +208,7 @@ pub fn prepare_working_directory(archive_path: &Path) -> Result<PathBuf> {
             .unwrap_or("backup")
             .strip_prefix("backup_")
             .unwrap_or("backup");
-            
+
         let extracted_dir = extract_to.join(dir_name);
         println!("ℹ Using extracted files from: {}", extracted_dir.display());
 
@@ -243,7 +262,7 @@ pub fn setup_backup_dirs() -> Result<(PathBuf, PathBuf), anyhow::Error> {
         let temp_dir = tempdir()
             .context("Failed to create temporary directory")?;
         println!("ℹ Using temporary directory: {}", temp_dir.path().display());
-        
+
         // Convert to PathBuf and leak the tempdir (so it's not deleted when temp_dir drops)
         temp_dir.into_path()
     };
