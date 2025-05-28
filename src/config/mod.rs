@@ -64,6 +64,13 @@ pub struct RestoreConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct SyncConfig {
+    pub source_db_url: String,
+    pub target_db_url: String,
+    pub databases_to_sync: Option<Vec<String>>, // If None, sync all eligible from source based on its list.
+}
+
+#[derive(Debug, Clone)]
 pub struct AppConfig {
     pub operation: Option<OperationConfig>,
     pub spaces_config: Option<SpacesConfig>,
@@ -74,6 +81,7 @@ pub struct AppConfig {
 pub enum OperationConfig {
     Backup(BackupConfig),
     Restore(RestoreConfig),
+    Sync(SyncConfig),
 }
 
 impl AppConfig {
@@ -202,5 +210,36 @@ pub fn load_restore_config_from_json(
         download_from_spaces,
         drop_target_database_if_exists: restore_opts.drop_target_database_if_exists,
         create_target_database_if_not_exists: restore_opts.create_target_database_if_not_exists,
+    })
+}
+
+pub fn load_sync_config_from_json(
+    raw_config: &RawJsonConfig,
+) -> Result<SyncConfig> {
+    let source_db_url = raw_config
+        .source_database_url
+        .as_ref()
+        .context("source_database_url must be set in config.json for sync operation")?
+        .clone();
+
+    let target_db_url = raw_config
+        .target_database_url
+        .as_ref()
+        .context("target_database_url must be set in config.json for sync operation")?
+        .clone();
+
+    let databases_to_sync = raw_config.database_list.clone();
+    if databases_to_sync.as_ref().map_or(true, |dbs| dbs.is_empty()) {
+         println!("Warning: 'database_list' in config.json is empty or not provided for sync operation. This means no databases will be synced unless discovered (if that feature is added). Currently, it likely means nothing will happen.");
+        // For sync, an empty or None list usually means no operation.
+        // Unlike backup where None might mean "all". For sync, explicit is better.
+        // Consider making database_list non-optional in RawJsonConfig for sync if it's always required.
+    }
+
+
+    Ok(SyncConfig {
+        source_db_url,
+        target_db_url,
+        databases_to_sync,
     })
 }

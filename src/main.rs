@@ -6,11 +6,13 @@
 mod utils;
 mod backup;
 mod restore;
+mod sync; // Added sync module
 mod config; // Added config module
 
 use anyhow::{Context, Result};
 use config::{
     AppConfig, OperationConfig, load_backup_config_from_json, load_restore_config_from_json,
+    load_sync_config_from_json,
 };
 use std::env;
 use std::path::PathBuf;
@@ -66,8 +68,16 @@ async fn run_app() -> Result<()> {
             restore::run_restore_flow(&app_config).await.context("Restore process failed")?;
 
         }
+        "3" | "sync" => {
+            println!("⚙️ Starting Sync Process...");
+            let sync_config = load_sync_config_from_json(&app_config.raw_json_config)
+                .context("Failed to load sync configuration from JSON")?;
+            app_config.operation = Some(OperationConfig::Sync(sync_config));
+            sync::run_sync_flow(&app_config).await
+                .context("Sync process failed")?;
+        }
         _ => {
-            println!("❌ Invalid choice. Please enter '1' (or 'backup') or '2' (or 'restore').");
+            println!("❌ Invalid choice. Please enter '1' (backup), '2' (restore), or '3' (sync).");
             anyhow::bail!("Invalid operation choice");
         }
     }
@@ -83,6 +93,7 @@ fn prompt_choice() -> Result<String> {
     println!("Select an operation:");
     println!("1. Take Backup (or type 'backup')");
     println!("2. Restore Backup (or type 'restore')");
+    println!("3. Sync Databases (Source to Target) (or type 'sync')");
     print!("Enter your choice: ");
     let _ = stdout().flush().context("Failed to flush stdout")?;
 
