@@ -2,63 +2,91 @@
 //!
 //! Provides CLI interface for database backup and restore operations
 
+// databasetool/src/main.rs
 mod utils;
 mod backup;
 mod restore;
-use dotenv::dotenv;
+mod config; // Added config module
+
+use anyhow::{Context, Result};
+use config::{
+    AppConfig, OperationConfig, load_backup_config_from_json, load_restore_config_from_json,
+};
 use std::env;
+use std::path::PathBuf;
+use std::process::ExitCode;
 
 /// Main entry point for the backup/restore tool
 #[tokio::main]
-async fn main() {
-    dotenv().ok();
+async fn main() -> ExitCode {
+    match run_app().await {
+        Ok(_) => {
+            println!("✅ Operation completed successfully.");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("❌ Error: {:?}", e);
+            ExitCode::FAILURE
+        }
+    }
+}
 
-    // Check for CLI argument first
+async fn run_app() -> Result<()> {
+    // Define the path to config.json. Expects it in the same directory as the executable
+    // or the project root if running with `cargo run`.
+    let config_path = PathBuf::from("config.json");
+    let mut app_config = AppConfig::load_from_json(&config_path)
+        .context(format!("Failed to load application configuration from {}", config_path.display()))?;
+
     let args: Vec<String> = env::args().collect();
     let choice = if args.len() > 1 {
         args[1].trim().to_string()
     } else {
-        prompt_choice()
+        prompt_choice()?
     };
 
+    let spaces_is_configured = app_config.spaces_config.is_some();
+
     match choice.as_str() {
-        "1" => run_backup().await,
-        "2" => run_restore().await,
-        _ => println!("❌ Invalid choice. Exiting."),
+        "1" | "backup" => {
+            println!("🚀 Starting Backup Process...");
+            let backup_config = load_backup_config_from_json(&app_config.raw_json_config, spaces_is_configured)
+                .context("Failed to load backup configuration from JSON")?;
+            app_config.operation = Some(OperationConfig::Backup(backup_config));
+            backup::run_backup_flow(&app_config).await
+                .context("Backup process failed")?;
+        }
+        "2" | "restore" => {
+            println!("🔄 Starting Restore Process...");
+            let restore_config = load_restore_config_from_json(&app_config.raw_json_config, spaces_is_configured)
+                .context("Failed to load restore configuration from JSON")?;
+            app_config.operation = Some(OperationConfig::Restore(restore_config.clone()));
+            
+            println!("Restore target: {}, Archive: {}", restore_config.target_db_url, restore_config.archive_source_path);
+            restore::run_restore_flow(&app_config).await.context("Restore process failed")?;
+
+        }
+        _ => {
+            println!("❌ Invalid choice. Please enter '1' (or 'backup') or '2' (or 'restore').");
+            anyhow::bail!("Invalid operation choice");
+        }
     }
+    Ok(())
 }
 
 /// Prompts user to select backup or restore operation
 ///
-/// Returns the user's choice as String ("1" or "2")
-fn prompt_choice() -> String {
+/// Returns the user's choice as String
+fn prompt_choice() -> Result<String> {
     use std::io::{stdin, stdout, Write};
 
     println!("Select an operation:");
-    println!("1. Take Backup");
-    println!("2. Restore Backup");
+    println!("1. Take Backup (or type 'backup')");
+    println!("2. Restore Backup (or type 'restore')");
     print!("Enter your choice: ");
-    let _ = stdout().flush();
+    let _ = stdout().flush().context("Failed to flush stdout")?;
 
     let mut input = String::new();
-    stdin().read_line(&mut input).unwrap();
-    input.trim().to_string()
-}
-
-
-/// Runs the backup workflow
-async fn run_backup() {
-    println!("\n🚀 Starting Backup Process...");
-
-    let backup = backup::logic::run_backup_flow().await;
-    backup.unwrap();
-}
-
-/// Runs the restore workflow
-async fn run_restore() {
-    println!("\n🔄 Starting Restore Process...");
-    
-    // Call the restore flow from logic module
-    let restore = restore::logic::run_restore_flow().await;
-    restore.unwrap()
+    stdin().read_line(&mut input).context("Failed to read user input")?;
+    Ok(input.trim().to_string())
 }

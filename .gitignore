@@ -2,3 +2,4 @@
 Cargo.lock
 backups/*
 temp_backups/*
+config.json

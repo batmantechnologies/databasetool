@@ -1,494 +1,265 @@
+// databasetool/src/restore/logic.rs
+use anyhow::{Context, Result};
 use std::fs;
-use std::env;
-use url::Url;
-use sqlx::PgPool;
-use anyhow::{Result, Context};
 use std::path::{Path, PathBuf};
-use sqlx::postgres::PgPoolOptions;
-use crate::utils::setting::{prepare_working_directory};
+use tempfile::TempDir;
+use url::Url;
 
-pub async fn restore_schema(pool: &PgPool, schema_path: &str) -> Result<()> {
-    let schema_content = fs::read_to_string(schema_path)
-        .with_context(|| format!("Failed to read schema file: {}", schema_path))?;
-
-    // Split into individual statements
-    let statements = split_sql_with_dollar_quotes(&schema_content);
-
-    // Separate statements into sequences, tables, and others
-    let (sequences, rest): (Vec<_>, Vec<_>) = statements.into_iter()
-        .partition(|stmt| stmt.contains("CREATE SEQUENCE"));
-
-    let (tables, others): (Vec<_>, Vec<_>) = rest.into_iter()
-        .partition(|stmt| stmt.contains("CREATE TABLE"));
-
-    // Phase 1: Create sequences first
-    for stmt in sequences {
-        let mut transaction = pool.begin().await?;
-        match sqlx::query(&stmt).execute(&mut *transaction).await {
-            Ok(_) => {
-                transaction.commit().await?;
-                println!("✅ Created sequence");
-            }
-            Err(e) if e.to_string().contains("already exists") => {
-                transaction.rollback().await?;
-                println!("ℹ Sequence already exists");
-            }
-            Err(e) => {
-                transaction.rollback().await?;
-                eprintln!("⚠️ Failed to create sequence: {}", e);
-                return Err(e.into());
-            }
-        }
-    }
-
-    // Phase 2: Create tables with retry logic
-    let mut remaining_tables = tables;
-    let mut attempts = 0;
-    const MAX_ATTEMPTS: usize = 3;
-
-    while !remaining_tables.is_empty() && attempts < MAX_ATTEMPTS {
-        attempts += 1;
-        let mut next_remaining = Vec::new();
-
-        for stmt in remaining_tables {
-            let mut transaction = pool.begin().await?;
-            match sqlx::query(&stmt).execute(&mut *transaction).await {
-                Ok(_) => {
-                    transaction.commit().await?;
-                    if let Some(table_name) = extract_table_name_from_create(&stmt) {
-                        println!("✅ Created table: {}", table_name);
-                    }
-                }
-                Err(e) if e.to_string().contains("already exists") => {
-                    transaction.rollback().await?;
-                    println!("ℹ Table already exists");
-                }
-                Err(e) => {
-                    transaction.rollback().await?;
-                    eprintln!("⚠️ Failed to create table (attempt {}): {}", attempts, e);
-                    next_remaining.push(stmt);
-                }
-            }
-        }
-
-        remaining_tables = next_remaining;
-    }
-
-    if !remaining_tables.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Failed to create {} tables after {} attempts",
-            remaining_tables.len(),
-            MAX_ATTEMPTS
-        ));
-    }
-
-    // Phase 3: Process other statements
-    for stmt in others {
-        let mut transaction = pool.begin().await?;
-        match sqlx::query(&stmt).execute(&mut *transaction).await {
-            Ok(_) => transaction.commit().await?,
-            Err(e) if e.to_string().contains("already exists") => {
-                transaction.rollback().await?;
-                println!("ℹ Object already exists");
-            }
-            Err(e) => {
-                transaction.rollback().await?;
-                eprintln!("⚠️ Failed to execute statement (skipping): {}", e);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-pub async fn restore_from_sql_file(pool: &PgPool, sql_path: &str) -> Result<()> {
-    let sql = fs::read_to_string(sql_path)
-        .with_context(|| format!("Failed to read SQL file: {}", sql_path))?;
-
-    let statements = split_sql_with_dollar_quotes(&sql);
-    let batch_size = 100; // Process in batches to avoid memory issues
-    let mut total_processed = 0;
-
-    for chunk in statements.chunks(batch_size) {
-        println!("Processing statements {}-{} of {}",
-            total_processed + 1,
-            total_processed + chunk.len(),
-            statements.len());
-
-        // Execute statements individually to avoid prepared statement issues
-        for stmt in chunk {
-            total_processed += 1;
-            // Split on semicolons and process each command separately
-            let commands: Vec<&str> = stmt.split(';')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
-
-            for cmd in commands {
-                if let Err(e) = sqlx::query(cmd).execute(pool).await {
-                    // Handle missing tables for INSERT statements
-                    if e.to_string().contains("relation") && e.to_string().contains("does not exist") {
-                        if let Some(table_name) = extract_table_name(stmt) {
-                            eprintln!("Table {} missing, attempting to create", table_name);
-                            if create_table_from_insert(stmt, pool).await.is_ok() {
-                                // Retry the statement after creating table
-                                if let Err(e) = sqlx::query(stmt).execute(pool).await {
-                                    eprintln!("⚠️ Failed to execute statement {} after creating table (skipping): {}\n{}",
-                                        total_processed, e, stmt);
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                    eprintln!("⚠️ Failed to execute statement {} (skipping): {}\n{}",
-                        total_processed, e, stmt);
-                }
-            }
-        }
-    }
-
-    println!("✅ Data restore completed ({} statements processed)", total_processed);
-    Ok(())
-}
-
-fn split_sql_with_dollar_quotes(sql: &str) -> Vec<String> {
-    let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut in_dollar_quote = false;
-    let mut quote_tag = String::new();
-    let mut in_single_quote = false;
-    let mut in_comment = false;
-
-    for line in sql.lines() {
-        let mut chars = line.chars().peekable();
-
-        while let Some(c) = chars.next() {
-            // Handle line comments
-            if !in_dollar_quote && !in_single_quote && c == '-' && chars.peek() == Some(&'-') {
-                chars.next(); // Skip second '-'
-                in_comment = true;
-                break;
-            }
-
-            match c {
-                '\'' if !in_dollar_quote && !in_comment => in_single_quote = !in_single_quote,
-                '$' if !in_single_quote && !in_comment => {
-                    if chars.peek() == Some(&'$') {
-                        chars.next();
-                        if !in_dollar_quote {
-                            // Start of dollar quote
-                            let mut tag = String::new();
-                            while let Some(&tc) = chars.peek() {
-                                if tc == '$' { break; }
-                                tag.push(tc);
-                                chars.next();
-                            }
-                            quote_tag = tag;
-                            in_dollar_quote = true;
-                        } else {
-                            // Check for end tag
-                            let mut potential_end = String::new();
-                            while let Some(&tc) = chars.peek() {
-                                if tc == '$' { break; }
-                                potential_end.push(tc);
-                                chars.next();
-                            }
-                            if potential_end == quote_tag {
-                                in_dollar_quote = false;
-                                quote_tag.clear();
-                            }
-                        }
-                    }
-                }
-                ';' if !in_dollar_quote && !in_single_quote && !in_comment => {
-                    current.push(c);
-                    if !current.trim().is_empty() {
-                        statements.push(current.trim().to_string());
-                    }
-                    current = String::new();
-                    continue;
-                }
-                _ => {}
-            }
-            current.push(c);
-        }
-
-        if !in_comment && !in_dollar_quote {
-            current.push('\n');
-        }
-        in_comment = false;
-    }
-
-    if !current.trim().is_empty() {
-        statements.push(current.trim().to_string());
-    }
-
-    // Handle function definitions as single statements
-    let mut final_statements = Vec::new();
-    let mut current_func = String::new();
-    let mut in_function = false;
-
-    for stmt in statements {
-        if stmt.contains("CREATE OR REPLACE FUNCTION") ||
-           stmt.contains("CREATE FUNCTION") {
-            in_function = true;
-            current_func = stmt;
-            continue;
-        }
-
-        if in_function {
-            current_func.push_str(&stmt);
-            if stmt.contains("LANGUAGE") && stmt.contains("$$") {
-                final_statements.push(current_func.trim().to_string());
-                current_func.clear();
-                in_function = false;
-            }
-        } else {
-            final_statements.push(stmt);
-        }
-    }
-
-    if !current_func.is_empty() {
-        final_statements.push(current_func);
-    }
-
-    final_statements
-}
+use crate::config::{AppConfig, RestoreConfig};
+use crate::restore::{db_restore, s3_download, verification};
+use crate::utils::setting::prepare_archive_for_restore; // Corrected import
 
 
-pub async fn run_restore_flow() -> Result<(), anyhow::Error> {
+/// Orchestrates the entire database restore process.
+pub async fn perform_restore_orchestration(
+    app_config: &AppConfig,
+    restore_config: &RestoreConfig,
+) -> Result<()> {
+    println!("🔄 Starting restore orchestration...");
+    println!("Restore configuration: {:?}", restore_config);
 
-    let original_url = env::var("TARGET_DATABASE_URL").context("TARGET_DATABASE_URL must be set")?;
-    let original_url = if original_url.starts_with("postgres://") || original_url.starts_with("postgresql://") {
-        original_url
-    } else {
-        format!("postgres://{}", original_url)
-    };
-    let db_names = env::var("DATABASE_LIST").context("DATABASE_LIST must be set")?;
-    let archive_path = env::var("ARCHIVE_FILE_PATH").context("ARCHIVE_FILE_PATH must be set")?;
+    // 1. Determine archive path: Download from S3 or use local path
+    let local_archive_path: PathBuf;
+    let _s3_download_temp_dir: Option<TempDir> = None; // To hold temp dir if downloaded
 
-    // Validate that the archive path is not empty
-    if archive_path.trim().is_empty() {
-        return Err(anyhow::anyhow!("ARCHIVE_FILE_PATH is empty"));
-    }
+    if restore_config.download_from_spaces {
+        let spaces_conf = app_config.spaces_config.as_ref().context(
+            "S3 download requested, but S3/Spaces configuration is missing.",
+        )?;
+        let (bucket, key) = s3_download::parse_s3_uri(&restore_config.archive_source_path)
+            .context("Failed to parse S3 URI for archive download")?;
 
-    let path = Path::new(&archive_path);
+        // Create a temporary directory to download the archive
+        let temp_s3_download_dir = tempfile::Builder::new()
+            .prefix("s3_download_")
+            .tempdir()
+            .context("Failed to create temporary directory for S3 download")?;
+        
+        let archive_filename = Path::new(&key)
+            .file_name()
+            .context("Could not determine filename from S3 key")?
+            .to_string_lossy()
+            .into_owned();
+            
+        let downloaded_path = temp_s3_download_dir.path().join(archive_filename);
 
-    // Check if file/directory exists
-    if !path.exists() {
-        return Err(anyhow::anyhow!("Archive path does not exist: {}", path.display()));
-    }
-
-    println!("📂 Using archive path: {}", path.display());
-
-    let working_path: PathBuf;
-
-    // Handle tar.gz files
-    if path.extension().map_or(false, |ext| ext == "gz") &&
-       path.file_stem().map_or(false, |stem| {
-                   let stem = stem.to_string_lossy();
-                   stem.ends_with(".tar") || stem.ends_with("_tar")
-               }) {
-               println!("🔍 Detected tar archive, extracting...");
-
-               working_path = prepare_working_directory(&path)?;
-    } else {
-        working_path = path.to_path_buf();
-    }
-
-    println!("ℹ Using backup path: {}", working_path.display());
-
-    // Show directory contents for debugging
-    if working_path.is_dir() {
-        println!("📁 Directory contents:");
-        match fs::read_dir(&working_path) {
-            Ok(entries) => {
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        println!("  - {}", entry.path().display());
-                    }
-                }
-            },
-            Err(e) => println!("⚠️ Could not read directory: {}", e),
-        }
-    }
-
-    // Process each database in the comma-separated list
-    for db_name in db_names.split(',').map(|s| s.trim()) {
-        let restored_db_name = format!("{}_restored", db_name);
-
-        // Create admin connection to postgres database
-        let mut admin_url = Url::parse(&original_url).context("Invalid database URL - must be in format postgres://user:password@host:port/database")?;
-        admin_url.set_path("/postgres");
-
-        let admin_pool = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&admin_url.to_string())
-            .await
-            .expect("Failed to create admin database pool");
-
-        // Check if restored database already exists
-        let db_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)"
+        s3_download::download_file_from_s3(
+            spaces_conf,
+            &bucket,
+            &key,
+            &downloaded_path,
         )
-        .bind(&restored_db_name)
-        .fetch_one(&admin_pool)
         .await
-        .expect("Failed to check database existence");
+        .context("Failed to download archive from S3/Spaces")?;
+        
+        local_archive_path = downloaded_path;
+        // _s3_download_temp_dir = Some(temp_s3_download_dir); 
+        // Guard will clean up. We just need the path for now.
+        // Actually, we DO need to keep the guard, otherwise the archive is deleted before extraction.
+        // So, the archive will live in this temp dir, then be extracted to another temp dir.
+        // This is acceptable.
+        // To avoid local_archive_path being dropped, we can move the temp_s3_download_dir
+        // to a variable that lives through the function scope.
+        // For simplicity now, let's assume `download_file_from_s3` returns the path
+        // and we need to ensure this path stays valid.
+        // The current structure: downloaded to temp_s3_download_dir; this dir guard needs to live.
+        // We will pass local_archive_path (which is inside _s3_download_temp_dir) to extraction.
+        // Best to keep _s3_download_temp_dir itself.
+        // Let's re-think. The archive is downloaded. Then prepare_archive_for_restore will extract it.
+        // So, the _s3_download_temp_dir must live until extraction is complete.
+        // The `local_archive_path` is what we need.
+        // The _s3_download_temp_dir will be dropped at end of this function.
+        // If prepare_archive_for_restore reads from local_archive_path while _s3_download_temp_dir
+        // is still in scope, it's fine.
+    } else {
+        local_archive_path = PathBuf::from(&restore_config.archive_source_path);
+        if !local_archive_path.exists() {
+            return Err(anyhow::anyhow!("Local archive path does not exist: {}", local_archive_path.display()));
+        }
+    }
+    println!("Using archive for restore: {}", local_archive_path.display());
 
-        if !db_exists {
-            println!("Creating empty restored database '{}'...", restored_db_name);
-            sqlx::query(&format!(r#"CREATE DATABASE "{}""#, restored_db_name))
-                .execute(&admin_pool)
-                .await
-                .expect("Failed to create empty restored database");
+    // 2. Prepare working directory by extracting the archive
+    // `extraction_temp_dir` guard ensures cleanup of extracted files.
+    let extraction_temp_dir = prepare_archive_for_restore(&local_archive_path)
+        .context("Failed to prepare archive and extract to temporary directory")?;
+    let extracted_files_path = extraction_temp_dir.path();
+    println!("Archive extracted to temporary directory: {}", extracted_files_path.display());
+
+    // List contents of extracted directory for debugging
+    println!("Contents of extracted directory ({}):", extracted_files_path.display());
+    for entry in fs::read_dir(extracted_files_path)? {
+        let entry = entry?;
+        println!("  - {}", entry.path().display());
+    }
+
+    // 3. Determine which databases to restore
+    //    If `restore_config.databases_to_restore` is Some, use that list.
+    //    If None, discover databases from the extracted files (e.g., by looking for *_schema.sql patterns).
+    let databases_to_process: Vec<String>;
+    if let Some(dbs_from_config) = &restore_config.databases_to_restore {
+        if dbs_from_config.is_empty() {
+             println!("DATABASE_LIST is empty in config. Attempting to discover databases from archive.");
+             databases_to_process = discover_databases_from_archive(extracted_files_path)?;
         } else {
-           println!("Restored database '{}' already exists", restored_db_name);
-           return Ok(());
+            databases_to_process = dbs_from_config.clone();
         }
+    } else {
+        println!("No DATABASE_LIST in config. Attempting to discover databases from archive.");
+        databases_to_process = discover_databases_from_archive(extracted_files_path)?;
+    }
 
-        // Create target URL for restored database
-        let mut target_url = Url::parse(&original_url).expect("Invalid database URL");
-        target_url.set_path(&format!("/{}", restored_db_name));
-        let target_url = target_url.to_string();
+    if databases_to_process.is_empty() {
+        anyhow::bail!("No databases found in archive or specified in config to restore.");
+    }
+    println!("Databases to be restored: {:?}", databases_to_process);
 
-        if !check_db_connection(&target_url).await {
-            println!("❌ Cannot connect to database. Exiting.");
-            return Ok(());
-        }
 
-        // Show target database info
-        let target_db = Url::parse(&target_url)
-            .expect("Invalid database URL")
-            .path()
-            .trim_start_matches('/')
-            .to_string();
-        println!("🔌 Connecting to target database: {}", target_db);
+    // 4. For each database:
+    for db_name_from_archive in &databases_to_process {
+        println!("\nProcessing restore for database from archive: {}", db_name_from_archive);
 
-        // Create pool connection for our target DB
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .connect(&target_url)
+        // Determine the actual target database name.
+        // Current TARGET_DATABASE_URL specifies the connection, and its path component is the DB name.
+        // If multiple databases are in the archive, we need a strategy:
+        //  a) Restore all into the single DB specified by TARGET_DATABASE_URL (potentially messy if schemas clash).
+        //  b) TARGET_DATABASE_URL's path is a template, and we append/replace with db_name_from_archive.
+        //  c) The config `databases_to_restore` should map archive DB names to target DB names if they differ.
+        // For now, assume TARGET_DATABASE_URL's path IS the target database name,
+        // and if multiple dbs are in archive, we restore them sequentially into this ONE target db.
+        // This is simplistic and might need refinement based on user intent.
+        // A better approach: if `databases_to_restore` is set, it means these specific DBs from the
+        // archive should be restored. If `TARGET_DATABASE_URL` points to `db_A`, and archive contains `db_X`, `db_Y`,
+        // and `databases_to_restore = ["db_X"]`, then `db_X` content goes into `db_A`.
+        // If `TARGET_DATABASE_URL` structure is `postgres://user:pass@host:port/`, and we want to restore `db_X` as `db_X_restored`,
+        // the target URL needs to be dynamically constructed.
+
+        // Let's use the db name from TARGET_DATABASE_URL as the *target* database for restoration.
+        // If multiple databases are listed in `databases_to_process`, they will all be restored into this one target.
+        // This might not be ideal if the archive contains distinct databases.
+        // The current config `RestoreConfig` has `target_db_url`. The database name is part of this URL.
+        
+        let target_db_name_from_url = db_restore::get_db_name_from_url(&restore_config.target_db_url)?;
+        println!("Target database for restore operations: {}", target_db_name_from_url);
+
+        // Manage the target database (drop/create if configured)
+        // This function uses the `target_db_name_from_url` to manage the DB on the server.
+        let _db_was_created_or_modified = db_restore::manage_target_database(restore_config, &target_db_name_from_url)
             .await
-            .expect("Failed to create database pool");
+            .with_context(|| format!("Failed to manage target database: {}", target_db_name_from_url))?;
 
-        let path = &working_path;
-        if path.is_dir() {
-            println!("📁 Processing directory backup format");
-            println!("ℹ Directory contents:");
-            for entry in fs::read_dir(path)? {
-                let entry = entry?;
-                println!("- {}", entry.path().display());
-            }
+        // Construct the specific URL for connecting to the now-managed target database.
+        // The host, port, user, pass come from restore_config.target_db_url.
+        // The path is the target_db_name_from_url.
+        let mut actual_target_db_conn_url = Url::parse(&restore_config.target_db_url)?;
+        actual_target_db_conn_url.set_path(&target_db_name_from_url);
+        let actual_target_db_conn_url_str = actual_target_db_conn_url.to_string();
 
-            let timestamp = path.file_name()
-                .and_then(|n| n.to_str())
-                .context("Invalid backup directory name - should be in format YYYYMMDD_HHMMSS")?;
+        // Create a connection pool to the target database for schema/data restore and verification
+        println!("Connecting to target database \'{}\' for restore operations...", target_db_name_from_url);
+        let target_db_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5) // Adjust as needed
+            .connect(&actual_target_db_conn_url_str)
+            .await
+            .with_context(|| format!("Failed to connect to target database \'{}\' at {} for restore operations", target_db_name_from_url, actual_target_db_conn_url_str))?;
 
-            println!("ℹ Extracted timestamp from directory name: {}", timestamp);
 
-            println!("🔍 Looking for backup files in: {}", path.display());
-            let schema_path = path.join(format!("{}_{}_schema.sql", db_name, timestamp));
-            let data_path = path.join(format!("{}_{}_data.sql", db_name, timestamp));
+        // Find schema and data files for `db_name_from_archive`
+        // The archive files are named like `dbname_YYYY-MM-DD_HH_MM_SS_schema.sql` or `dbname_schema.sql`
+        // We need to find the correct schema/data files within `extracted_files_path`
+        // that correspond to `db_name_from_archive`.
+        // The `db_dump` module created files like `DBNAME_schema.sql` and `DBNAME_data.sql`.
+        
+        let schema_file_name = format!("{}_schema.sql", db_name_from_archive);
+        let schema_file_path = extracted_files_path.join(&schema_file_name);
 
-            println!("ℹ Expected schema file: {}", schema_path.display());
-            println!("ℹ Expected data file: {}", data_path.display());
+        let data_file_name = format!("{}_data.sql", db_name_from_archive);
+        let data_file_path = extracted_files_path.join(&data_file_name);
 
-            if !schema_path.exists() {
-                return Err(anyhow::anyhow!(
-                    "Schema file not found: {}",
-                    schema_path.display()
-                ));
-            }
-            if !data_path.exists() {
-                return Err(anyhow::anyhow!(
-                    "Data file not found: {}",
-                    data_path.display()
-                ));
-            }
-
-            println!("✅ Found both schema and data files");
-
-            // Restore schema first
-            println!("🔄 Starting schema restoration...");
-            match restore_schema(&pool, &schema_path.to_string_lossy()).await {
-                Ok(_) => println!("✅ Schema restoration completed"),
-                Err(e) => {
-                    eprintln!("❌ Schema restoration failed: {}", e);
-                    return Err(e);
-                }
-            }
-
-            // Then restore data
-            println!("🔄 Starting data restoration...");
-            match restore_from_sql_file(&pool, &data_path.to_string_lossy()).await {
-                Ok(_) => println!("✅ Data restoration completed"),
-                Err(e) => {
-                    eprintln!("❌ Data restoration failed: {}", e);
-                    return Err(e);
-                }
-            }
-        } else {
-            // Handle single file case (legacy)
-            restore_from_sql_file(&pool, &archive_path).await
-                .context("Restore failed")?;
+        if !schema_file_path.exists() {
+            return Err(anyhow::anyhow!(
+                "Schema file not found for database '{}' in extracted archive: {}. Expected pattern: {}_schema.sql",
+                db_name_from_archive, schema_file_path.display(), db_name_from_archive
+            ));
         }
+         if !data_file_path.exists() {
+            // Data file might be optional for some backup types (e.g. schema-only)
+            // However, our current backup process creates both.
+            println!(
+                "Warning: Data file not found for database '{}' in extracted archive: {}. Expected pattern: {}_data.sql. Proceeding with schema restore only.",
+                db_name_from_archive, data_file_path.display(), db_name_from_archive
+            );
+        }
+
+        // 4a. Restore schema
+        println!("Restoring schema for {} from {}...", db_name_from_archive, schema_file_path.display());
+        db_restore::restore_database_schema(&actual_target_db_conn_url_str, &schema_file_path)
+            .await
+            .with_context(|| format!("Failed to restore schema for database \'{}\' from file {}", db_name_from_archive, schema_file_path.display()))?;
+        println!("✓ Schema restoration completed for {}.", db_name_from_archive);
+
+        // 4b. Restore data (if data file exists)
+        if data_file_path.exists() {
+            println!("Restoring data for {} from {}...", db_name_from_archive, data_file_path.display());
+            db_restore::restore_database_data(&actual_target_db_conn_url_str, &data_file_path)
+                .await
+                .with_context(|| format!("Failed to restore data for database \'{}\' from file {}", db_name_from_archive, data_file_path.display()))?;
+            println!("✓ Data restoration completed for {}.", db_name_from_archive);
+        } else {
+             println!("Skipping data restoration for {} as data file was not found.", db_name_from_archive);
+        }
+
+        // 4c. Verify restore for this database
+        verification::verify_restore(&target_db_pool, restore_config, &target_db_name_from_url, extracted_files_path)
+            .await
+            .with_context(|| format!("Failed to verify_restore for database \'{}\'", target_db_name_from_url))?;
+        
+        // Close the pool for the current database being restored
+        target_db_pool.close().await;
     }
 
-    println!("\n✅ Restore completed.");
+    // 5. Cleanup: extraction_temp_dir and _s3_download_temp_dir (if any) will be cleaned up when they go out of scope.
+    println!("✓ Restore orchestration completed.");
     Ok(())
 }
 
-async fn check_db_connection(db_url: &str) -> bool {
-    PgPoolOptions::new().max_connections(1).connect(db_url).await.is_ok()
-}
 
-fn extract_table_name_from_create(query: &str) -> Option<String> {
-    if query.starts_with("CREATE TABLE") {
-        let parts: Vec<&str> = query.split_whitespace().collect();
-        if parts.len() >= 3 {
-            Some(parts[2].trim_matches('"').to_string())
-        } else {
-            None
+/// Discovers database names from the files in the extracted archive directory.
+/// Looks for files matching `*_schema.sql`.
+fn discover_databases_from_archive(extracted_path: &Path) -> Result<Vec<String>> {
+    let mut db_names = Vec::new();
+    for entry in fs::read_dir(extracted_path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(file_name_os) = path.file_name() {
+                let file_name = file_name_os.to_string_lossy();
+                if file_name.ends_with("_schema.sql") {
+                    if let Some(db_name) = file_name.strip_suffix("_schema.sql") {
+                        if !db_name.is_empty() {
+                            db_names.push(db_name.to_string());
+                        }
+                    }
+                }
+            }
         }
-    } else {
-        None
     }
-}
-
-fn extract_table_name(query: &str) -> Option<String> {
-    if query.starts_with("INSERT INTO") {
-        let start = query.find("INSERT INTO")? + "INSERT INTO".len();
-        let end = query[start..].find(' ').map(|i| start + i).unwrap_or(query.len());
-        Some(query[start..end].trim().trim_matches('"').to_string())
+    db_names.sort();
+    db_names.dedup();
+    if db_names.is_empty() {
+         println!("Warning: Could not discover any database schema files (*_schema.sql) in the archive at {}", extracted_path.display());
     } else {
-        None
+        println!("Discovered databases from archive: {:?}", db_names);
     }
+    Ok(db_names)
 }
 
-async fn create_table_from_insert(query: &str, pool: &PgPool) -> Result<(), sqlx::Error> {
-    eprintln!("Creating table from INSERT statement");
-    let table_name = extract_table_name(query)
-        .ok_or(sqlx::Error::Protocol("Could not extract table name".into()))?;
 
-    // Extract column names from INSERT statement
-    let cols_start = query.find('(')
-        .ok_or(sqlx::Error::Protocol("Could not find column list".into()))? + 1;
-    let cols_end = query[cols_start..].find(')')
-        .ok_or(sqlx::Error::Protocol("Could not find column list end".into()))?;
-    let cols_str = &query[cols_start..cols_start + cols_end];
-
-    let columns: Vec<&str> = cols_str.split(',')
-        .map(|s| s.trim().trim_matches('"'))
-        .collect();
-
-    // Create table with TEXT columns by default (simplest approach)
-    let create_sql = format!(
-        "CREATE TABLE IF NOT EXISTS \"{}\" ({})",
-        table_name,
-        columns.iter().map(|c| format!("\"{}\" TEXT", c)).collect::<Vec<_>>().join(", ")
-    );
-
-    sqlx::query(&create_sql).execute(pool).await?;
-    Ok(())
-}
+// Old functions from the original logic.rs, to be removed after full refactor.
+/*
+Original run_restore_flow and its helpers like restore_schema, restore_from_sql_file,
+split_sql_with_dollar_quotes, check_db_connection (within restore),
+extract_table_name_from_create, extract_table_name, create_table_from_insert.
+These are being replaced by the new modular approach with perform_restore_orchestration,
+db_restore module, etc.
+*/
