@@ -19,6 +19,11 @@ fn find_psql_executable() -> Result<PathBuf> {
     which("psql").context("psql executable not found in PATH. Please ensure PostgreSQL client tools are installed and in your PATH.")
 }
 
+/// Finds the pg_restore executable in the system PATH.
+fn find_pg_restore_executable() -> Result<PathBuf> {
+    which("pg_restore").context("pg_restore executable not found in PATH. Please ensure PostgreSQL client tools are installed and in your PATH.")
+}
+
 /// Orchestrates the database synchronization process.
 ///
 /// For each database specified in the sync configuration:
@@ -37,7 +42,8 @@ pub async fn perform_sync_orchestration(
     println!("Sync configuration: {:?}", sync_config);
 
     let pg_dump_path = find_pg_dump_executable()?;
-    let psql_path = find_psql_executable()?; // psql is needed for restore
+    let psql_path = find_psql_executable()?; // psql is needed for schema restore
+    let pg_restore_path = find_pg_restore_executable()?; // pg_restore is needed for data restore
 
     let databases_to_sync = match &sync_config.databases_to_sync {
         Some(dbs) if !dbs.is_empty() => dbs.clone(),
@@ -93,7 +99,7 @@ pub async fn perform_sync_orchestration(
         println!("Dumping data for {} from {} to {}...", db_name, source_db_specific_url, data_file_path.display());
         let data_dump_cmd_output = Command::new(&pg_dump_path)
             .arg("--data-only")
-            .arg("--column-inserts") // Or --inserts
+            .arg("--format=custom") // Use custom format for pg_restore compatibility
             .arg("-f")
             .arg(&data_file_path)
             .arg(&source_db_specific_url)
@@ -155,25 +161,27 @@ pub async fn perform_sync_orchestration(
 
         // --- 6. Restore Data to Target ---
         println!("Restoring data for {} to target database {}...", db_name, target_db_specific_url);
-        let psql_data_restore_output = Command::new(&psql_path)
-            .arg("-X")
-            .arg("-q")
-            .arg("-v")
-            .arg("ON_ERROR_STOP=1")
-            .arg("-d")
+        
+        // Use pg_restore with disable-triggers option to handle foreign key constraints
+        let pg_restore_data_output = Command::new(&pg_restore_path)
+            .arg("--data-only")
+            .arg("--disable-triggers") // Disable triggers during data restore to avoid FK violations
+            .arg("--no-owner")
+            .arg("--no-acl")
+            .arg("--exit-on-error")
+            .arg("--dbname")
             .arg(&target_db_specific_url)
-            .arg("-f")
             .arg(&data_file_path)
             .output()
-            .with_context(|| format!("Failed to execute psql for data restore to target database: {}", db_name))?;
+            .with_context(|| format!("Failed to execute pg_restore for data restore to target database: {}", db_name))?;
 
-        if !psql_data_restore_output.status.success() {
+        if !pg_restore_data_output.status.success() {
             return Err(anyhow::anyhow!(
-                "psql (data restore) for target database {} failed with status: {}\\nStdout: {}\\nStderr: {}",
+                "pg_restore (data restore) for target database {} failed with status: {}\\nStdout: {}\\nStderr: {}",
                 db_name,
-                psql_data_restore_output.status,
-                String::from_utf8_lossy(&psql_data_restore_output.stdout),
-                String::from_utf8_lossy(&psql_data_restore_output.stderr)
+                pg_restore_data_output.status,
+                String::from_utf8_lossy(&pg_restore_data_output.stdout),
+                String::from_utf8_lossy(&pg_restore_data_output.stderr)
             ));
         }
         println!("✓ Data for target {} restored successfully.", db_name);
