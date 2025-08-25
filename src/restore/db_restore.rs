@@ -1,19 +1,17 @@
 // databasetool/src/restore/db_restore.rs
 use anyhow::{Context, Result};
 use sqlx::{Pool, Postgres};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tempfile::NamedTempFile;
 use url::Url;
-use which::which;
+use crate::utils::find_psql_executable;
 
 use crate::config::RestoreConfig;
 
-/// Finds the psql executable in the system PATH.
-fn find_psql_executable() -> Result<PathBuf> {
-    which("psql").context(
-        "psql executable not found in PATH. Please ensure PostgreSQL client tools are installed and in your PATH.",
-    )
-}
+
+
 
 /// Executes a SQL file against the specified database using the `psql` command-line tool.
 ///
@@ -21,10 +19,14 @@ fn find_psql_executable() -> Result<PathBuf> {
 /// * `target_db_url` - The connection URL string for the target database.
 /// * `sql_file_path` - Path to the .sql file to execute.
 /// * `log_context` - A string for logging context (e.g., "schema", "data").
+/// * `source_db_name` - Optional source database name for renaming (if provided, replaces occurrences in SQL).
+/// * `target_db_name` - Optional target database name for renaming.
 async fn execute_sql_file_with_psql(
     target_db_url: &str,
     sql_file_path: &Path,
     log_context: &str,
+    source_db_name: Option<&str>,
+    target_db_name: Option<&str>,
 ) -> Result<()> {
     if !sql_file_path.exists() {
         return Err(anyhow::anyhow!(
@@ -42,6 +44,33 @@ async fn execute_sql_file_with_psql(
         target_db_url // Be mindful of logging full URLs with credentials in production
     );
 
+    // If database renaming is requested, create a temporary file with replaced content
+    let (sql_file_to_execute, _temp_file_guard) = if let (Some(source), Some(target)) = (source_db_name, target_db_name) {
+        if source != target {
+            println!("Renaming database references from '{}' to '{}' in {} file", source, target, log_context);
+            let sql_content = fs::read_to_string(sql_file_path)
+                .with_context(|| format!("Failed to read {} SQL file: {}", log_context, sql_file_path.display()))?;
+            
+            // Replace database name references intelligently
+            let mut modified_content = replace_database_references(&sql_content, source, target);
+            
+            // Add constraint handling for data files
+            if log_context == "data" {
+                modified_content = format!("SET session_replication_role = 'replica';\n{}\nSET session_replication_role = 'origin';", modified_content);
+            }
+            
+            let temp_file = NamedTempFile::new()?;
+            fs::write(&temp_file, modified_content)
+                .with_context(|| format!("Failed to write modified {} SQL content", log_context))?;
+            let temp_path = temp_file.into_temp_path();
+            (temp_path.to_path_buf(), Some(temp_path))
+        } else {
+            (PathBuf::from(sql_file_path), None)
+        }
+    } else {
+        (PathBuf::from(sql_file_path), None)
+    };
+
     let output = Command::new(psql_path)
         .arg("-X") // Do not read psqlrc
         .arg("-q") // Quiet mode
@@ -50,13 +79,13 @@ async fn execute_sql_file_with_psql(
         .arg("-d")
         .arg(target_db_url)
         .arg("-f")
-        .arg(sql_file_path)
+        .arg(&sql_file_to_execute)
         .output()
         .with_context(|| {
             format!(
                 "Failed to execute psql for {} restoration of file: {}",
                 log_context,
-                sql_file_path.display()
+                sql_file_to_execute.display()
             )
         })?;
 
@@ -173,38 +202,109 @@ async fn create_database_if_not_exists(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_database_renaming_in_sql_content() -> Result<()> {
+        // Create a temporary directory and SQL file
+        let temp_dir = tempdir()?;
+        let sql_file_path = temp_dir.path().join("test_schema.sql");
+        
+        // SQL content with original database name
+        let sql_content = r#"
+CREATE DATABASE hotelrule_prod;
+\c hotelrule_prod
+
+CREATE SCHEMA IF NOT EXISTS hotelrule_prod;
+CREATE TABLE hotelrule_prod.users (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100)
+);
+
+ALTER TABLE hotelrule_prod.users OWNER TO hotelrule_prod_admin;
+"#;
+        
+        fs::write(&sql_file_path, sql_content)?;
+
+        // Test renaming functionality using the new robust function
+        let modified_content = replace_database_references(sql_content, "hotelrule_prod", "hotelrule_prod_dev");
+
+        // Debug: print the modified content to see what actually happened
+        println!("Original content:\n{}", sql_content);
+        println!("Modified content:\n{}", modified_content);
+        
+        // Verify the replacements worked
+        assert!(modified_content.contains("CREATE DATABASE hotelrule_prod_dev"));
+        assert!(modified_content.contains("\\c hotelrule_prod_dev"));
+        assert!(modified_content.contains("hotelrule_prod_dev.users"));
+        assert!(!modified_content.contains("CREATE DATABASE hotelrule_prod;"));
+        assert!(!modified_content.contains("\\c hotelrule_prod;"));
+        assert!(!modified_content.contains("hotelrule_prod.users"));
+
+        Ok(())
+    }
+}
+
+/// Intelligently replaces database name references in SQL content
+fn replace_database_references(sql_content: &str, source_db: &str, target_db: &str) -> String {
+    if source_db == target_db {
+        return sql_content.to_string();
+    }
+    
+    // Use a more robust approach that doesn't hardcode specific patterns
+    // Focus on replacing the database name as a standalone identifier
+    let mut result = sql_content.to_string();
+    
+    // Replace database name in common contexts where it appears as an identifier
+    let patterns = vec![
+        format!(" {} ", source_db),
+        format!("\"{}\" ", source_db),
+        format!(" {}.", source_db),
+        format!("\"{}\".", source_db),
+        format!(" {};", source_db),
+        format!("\"{}\";", source_db),
+        format!("\\c {}", source_db),
+        format!("\\c \"{}\"", source_db),
+    ];
+    
+    for pattern in patterns {
+        let replacement = pattern.replace(source_db, target_db);
+        result = result.replace(&pattern, &replacement);
+    }
+    
+    result
+}
+
 /// Restores schema for a single database from its SQL file using psql.
 pub async fn restore_database_schema(
     target_db_url: &str,
     schema_sql_path: &Path,
+    source_db_name: Option<&str>,
+    target_db_name: Option<&str>,
 ) -> Result<()> {
     println!(
         "Restoring schema from {} into target database (using psql)",
         schema_sql_path.display()
     );
-    execute_sql_file_with_psql(target_db_url, schema_sql_path, "schema").await
+    execute_sql_file_with_psql(target_db_url, schema_sql_path, "schema", source_db_name, target_db_name).await
 }
 
 /// Restores data for a single database from its SQL file using psql.
 pub async fn restore_database_data(
     target_db_url: &str,
     data_sql_path: &Path,
+    source_db_name: Option<&str>,
+    target_db_name: Option<&str>,
 ) -> Result<()> {
     println!(
         "Restoring data from {} into target database (using psql)",
         data_sql_path.display()
     );
-    execute_sql_file_with_psql(target_db_url, data_sql_path, "data").await
+    
+    // Execute the data restoration (constraint handling is now embedded in the SQL file)
+    execute_sql_file_with_psql(target_db_url, data_sql_path, "data", source_db_name, target_db_name).await
 }
 
-/// Extracts the database name from a PostgreSQL connection URL.
-pub fn get_db_name_from_url(db_url: &str) -> Result<String> {
-    let parsed_url = Url::parse(db_url)
-        .with_context(|| format!("Invalid database URL format: {}", db_url))?;
-    let path = parsed_url.path().trim_start_matches('/');
-    if path.is_empty() {
-        Err(anyhow::anyhow!("Database name not found in URL path: {}", db_url))
-    } else {
-        Ok(path.to_string())
-    }
-}

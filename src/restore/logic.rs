@@ -94,30 +94,32 @@ pub async fn perform_restore_orchestration(
     }
 
     // 3. Determine which databases to restore
-    //    If `restore_config.databases_to_restore` is Some, use that list.
-    //    If None, discover databases from the extracted files (e.g., by looking for *_schema.sql patterns).
-    let databases_to_process: Vec<String>;
+    //    If `restore_config.databases_to_restore` is Some, use that mapping.
+    //    If None, discover databases from the extracted files and map them to themselves.
+    let databases_to_process: std::collections::HashMap<String, String>;
     if let Some(dbs_from_config) = &restore_config.databases_to_restore {
         if dbs_from_config.is_empty() {
              println!("DATABASE_LIST is empty in config. Attempting to discover databases from archive.");
-             databases_to_process = discover_databases_from_archive(extracted_files_path)?;
+             let discovered_dbs = discover_databases_from_archive(extracted_files_path)?;
+             databases_to_process = discovered_dbs.into_iter().map(|db| (db.clone(), db)).collect();
         } else {
             databases_to_process = dbs_from_config.clone();
         }
     } else {
         println!("No DATABASE_LIST in config. Attempting to discover databases from archive.");
-        databases_to_process = discover_databases_from_archive(extracted_files_path)?;
+        let discovered_dbs = discover_databases_from_archive(extracted_files_path)?;
+        databases_to_process = discovered_dbs.into_iter().map(|db| (db.clone(), db)).collect();
     }
 
     if databases_to_process.is_empty() {
         anyhow::bail!("No databases found in archive or specified in config to restore.");
     }
-    println!("Databases to be restored: {:?}", databases_to_process);
+    println!("Databases to be restored (source -> target): {:?}", databases_to_process);
 
 
-    // 4. For each database:
-    for db_name_from_archive in &databases_to_process {
-        println!("\nProcessing restore for database from archive: {}", db_name_from_archive);
+    // 4. For each database mapping:
+    for (db_name_from_archive, target_db_name) in &databases_to_process {
+        println!("\nProcessing restore for database from archive: {} -> {}", db_name_from_archive, target_db_name);
 
         // Determine the actual target database name.
         // Current TARGET_DATABASE_URL specifies the connection, and its path component is the DB name.
@@ -134,34 +136,29 @@ pub async fn perform_restore_orchestration(
         // If `TARGET_DATABASE_URL` structure is `postgres://user:pass@host:port/`, and we want to restore `db_X` as `db_X_restored`,
         // the target URL needs to be dynamically constructed.
 
-        // Let's use the db name from TARGET_DATABASE_URL as the *target* database for restoration.
-        // If multiple databases are listed in `databases_to_process`, they will all be restored into this one target.
-        // This might not be ideal if the archive contains distinct databases.
-        // The current config `RestoreConfig` has `target_db_url`. The database name is part of this URL.
-        
-        let target_db_name_from_url = db_restore::get_db_name_from_url(&restore_config.target_db_url)?;
-        println!("Target database for restore operations: {}", target_db_name_from_url);
+        // Use the target database name from the mapping for restoration
+        println!("Target database for restore operations: {}", target_db_name);
 
         // Manage the target database (drop/create if configured)
-        // This function uses the `target_db_name_from_url` to manage the DB on the server.
-        let _db_was_created_or_modified = db_restore::manage_target_database(restore_config, &target_db_name_from_url)
+        // This function uses the target database name from the mapping to manage the DB on the server.
+        let _db_was_created_or_modified = db_restore::manage_target_database(restore_config, target_db_name)
             .await
-            .with_context(|| format!("Failed to manage target database: {}", target_db_name_from_url))?;
+            .with_context(|| format!("Failed to manage target database: {}", target_db_name))?;
 
         // Construct the specific URL for connecting to the now-managed target database.
         // The host, port, user, pass come from restore_config.target_db_url.
-        // The path is the target_db_name_from_url.
+        // The path is the target database name from the mapping.
         let mut actual_target_db_conn_url = Url::parse(&restore_config.target_db_url)?;
-        actual_target_db_conn_url.set_path(&target_db_name_from_url);
+        actual_target_db_conn_url.set_path(target_db_name);
         let actual_target_db_conn_url_str = actual_target_db_conn_url.to_string();
 
         // Create a connection pool to the target database for schema/data restore and verification
-        println!("Connecting to target database \'{}\' for restore operations...", target_db_name_from_url);
+        println!("Connecting to target database \'{}\' for restore operations...", target_db_name);
         let target_db_pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(5) // Adjust as needed
             .connect(&actual_target_db_conn_url_str)
             .await
-            .with_context(|| format!("Failed to connect to target database \'{}\' at {} for restore operations", target_db_name_from_url, actual_target_db_conn_url_str))?;
+            .with_context(|| format!("Failed to connect to target database \'{}\' at {} for restore operations", target_db_name, actual_target_db_conn_url_str))?;
 
 
         // Find schema and data files for `db_name_from_archive`
@@ -193,7 +190,7 @@ pub async fn perform_restore_orchestration(
 
         // 4a. Restore schema
         println!("Restoring schema for {} from {}...", db_name_from_archive, schema_file_path.display());
-        db_restore::restore_database_schema(&actual_target_db_conn_url_str, &schema_file_path)
+        db_restore::restore_database_schema(&actual_target_db_conn_url_str, &schema_file_path, Some(db_name_from_archive), Some(target_db_name))
             .await
             .with_context(|| format!("Failed to restore schema for database \'{}\' from file {}", db_name_from_archive, schema_file_path.display()))?;
         println!("✓ Schema restoration completed for {}.", db_name_from_archive);
@@ -201,7 +198,7 @@ pub async fn perform_restore_orchestration(
         // 4b. Restore data (if data file exists)
         if data_file_path.exists() {
             println!("Restoring data for {} from {}...", db_name_from_archive, data_file_path.display());
-            db_restore::restore_database_data(&actual_target_db_conn_url_str, &data_file_path)
+            db_restore::restore_database_data(&actual_target_db_conn_url_str, &data_file_path, Some(db_name_from_archive), Some(target_db_name))
                 .await
                 .with_context(|| format!("Failed to restore data for database \'{}\' from file {}", db_name_from_archive, data_file_path.display()))?;
             println!("✓ Data restoration completed for {}.", db_name_from_archive);
@@ -210,9 +207,9 @@ pub async fn perform_restore_orchestration(
         }
 
         // 4c. Verify restore for this database
-        verification::verify_restore(&target_db_pool, restore_config, &target_db_name_from_url, extracted_files_path)
+        verification::verify_restore(&target_db_pool, restore_config, target_db_name, extracted_files_path)
             .await
-            .with_context(|| format!("Failed to verify_restore for database \'{}\'", target_db_name_from_url))?;
+            .with_context(|| format!("Failed to verify_restore for database \'{}\'", target_db_name))?;
         
         // Close the pool for the current database being restored
         target_db_pool.close().await;

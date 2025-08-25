@@ -1,0 +1,60 @@
+
+🔄 Starting Restore Process...
+📂 Using archive path: /tmp/backup_2025-04-30_17_38_36.tar.gz
+🔍 Detected tar archive, extracting...
+
+📦 Preparing working directory...
+- Input path: /tmp/backup_2025-04-30_17_38_36.tar.gz
+- Is tar.gz: true
+- Is directory: false
+🔍 Extracting /tmp/backup_2025-04-30_17_38_36.tar.gz to /tmp
+ℹ Using extracted files from: /tmp/2025-04-30_17_38_36
+ℹ Using backup path: /tmp/2025-04-30_17_38_36
+📁 Directory contents:
+  - /tmp/2025-04-30_17_38_36/addrtranservice_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/addrtranservice_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/addrmasterservice_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/addrmasterservice_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/appregistrationservice_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/appregistrationservice_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/assessmentservice_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/assessmentservice_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/assmttransaction_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/assmttransaction_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/authorisationservice_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/authorisationservice_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/courseservice_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/courseservice_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/customfieldsmasterservice_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/customfieldsmasterservice_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/customfieldstransservice_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/customfieldstransservice_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/fileservice_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/fileservice_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/hightranspermissionservice_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/hightranspermissionservice_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/historyservice_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/historyservice_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/kahnotifications_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/kahnotifications_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/masterpermissionservice_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/masterpermissionservice_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/memberservice_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/memberservice_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/passwordservice_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/passwordservice_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/physicalunitservice_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/physicalunitservice_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/saltservice_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/saltservice_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/tokenservice_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/tokenservice_2025-04-30_17_38_36_data.sql
+  - /tmp/2025-04-30_17_38_36/userprofileservice_2025-04-30_17_38_36_schema.sql
+  - /tmp/2025-04-30_17_38_36/userprofileservice_2025-04-30_17_38_36_data.sql
+ℹ Restored database 'addrtranservice_restored' already exists, skipping creation.
+🔌 Attempting to connect to target database: addrtranservice_restored
+✅ Connected to target database: addrtranservice_restored
+📁 Processing directory backup format for database 'addrtranservice'
+ℹ Could not infer timestamp from directory name, looking for standard names.
+🔍 Looking for schema file: /tmp/2025-04-30_17_38_36/addrtranservice_schema.sql
+🔍 Looking for data file: /tmp/2025-04-30_17_38_36/addrtranservice_data.sql

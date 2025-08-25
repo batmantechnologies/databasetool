@@ -1,10 +1,11 @@
 // databasetool/src/sync/logic.rs
 use anyhow::{Context, Result};
+use which::which;
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::Builder as TempFileBuilder;
 use url::Url;
-use which::{which};
+use crate::utils::find_psql_executable;
 
 use crate::config::{AppConfig, SyncConfig};
 use crate::restore::db_restore; // For manage_target_database and psql execution
@@ -14,10 +15,7 @@ fn find_pg_dump_executable() -> Result<PathBuf> {
     which("pg_dump").context("pg_dump executable not found in PATH. Please ensure PostgreSQL client tools are installed and in your PATH.")
 }
 
-/// Finds the psql executable in the system PATH.
-fn find_psql_executable() -> Result<PathBuf> {
-    which("psql").context("psql executable not found in PATH. Please ensure PostgreSQL client tools are installed and in your PATH.")
-}
+
 
 /// Finds the pg_restore executable in the system PATH.
 fn find_pg_restore_executable() -> Result<PathBuf> {
