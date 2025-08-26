@@ -1,6 +1,6 @@
 // databasetool/src/restore/verification.rs
-use anyhow::Result;
-use sqlx::{Pool, Postgres};
+use anyhow::{Context, Result};
+use sqlx::{Pool, Postgres, Row};
 use crate::config::RestoreConfig;
 
 /// Verifies the integrity of the restored database.
@@ -40,6 +40,18 @@ pub async fn verify_restore(
         println!("Found {} tables in public schema: {:?}", tables.len(), tables.iter().map(|t| &t.0).collect::<Vec<&String>>());
     }
 
+    // Debug: Check for common system tables (framework-agnostic)
+    println!("Checking for common system tables...");
+    let common_tables = vec!["migrations", "schema_migrations", "users", "permissions"];
+    for table_name in common_tables {
+        let check_query = format!("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '{}')", table_name);
+        let exists: (bool,) = sqlx::query_as(&check_query)
+            .fetch_one(db_pool)
+            .await
+            .unwrap_or((false,));
+        println!("   Table {} exists: {}", table_name, exists.0);
+    }
+
     // TODO: Implement more comprehensive verification steps:
     // 1. Parse schema files from `extracted_backup_path` to get a list of expected tables.
     //    - For each expected table, query `information_schema.tables` to confirm its existence.
@@ -49,5 +61,164 @@ pub async fn verify_restore(
     // 3. Check for specific sentinel data if applicable.
 
     println!("✓ Basic restore verification completed for {}.", _restored_db_name);
+    
+    // Reset sequences to prevent migration failures in any framework
+    println!("Starting sequence reset for database: {}", _restored_db_name);
+    reset_sequences(db_pool, _restored_db_name).await?;
+    println!("✅ Sequence reset completed for {}", _restored_db_name);
+    
+    Ok(())
+}
+
+/// Resets all PostgreSQL sequences to match the maximum values of their corresponding tables
+/// This prevents migration failures due to sequence desynchronization in any framework
+async fn reset_sequences(db_pool: &Pool<Postgres>, db_name: &str) -> Result<()> {
+    println!("🔄 Resetting sequences for database: {}", db_name);
+    println!("   This will prevent migration failures due to sequence desynchronization in any framework");
+    
+    // Get all sequences and their corresponding tables/columns
+    let sequences_query = r#"
+        SELECT 
+            seq.relname as sequence_name,
+            dep.deptype as dependency_type,
+            tab.relname as table_name,
+            attr.attname as column_name
+        FROM 
+            pg_class seq
+        JOIN 
+            pg_depend dep ON dep.objid = seq.oid AND dep.deptype = 'a'
+        JOIN 
+            pg_class tab ON dep.refobjid = tab.oid
+        JOIN 
+            pg_attribute attr ON dep.refobjid = attr.attrelid AND dep.refobjsubid = attr.attnum
+        WHERE 
+            seq.relkind = 'S'
+            AND tab.relkind = 'r'
+            AND tab.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+        ORDER BY 
+            tab.relname, attr.attname
+    "#;
+    
+    let sequences: Vec<(String, String, String, String)> = sqlx::query_as(sequences_query)
+        .fetch_all(db_pool)
+        .await
+        .context("Failed to fetch sequence information")?;
+    
+    if sequences.is_empty() {
+        println!("ℹ️  No sequences found in public schema for database: {}", db_name);
+        return Ok(());
+    }
+    
+    println!("Found {} sequences to reset", sequences.len());
+    println!("   Sequences found: {:?}", sequences.iter().map(|(seq, _, _, _)| seq.clone()).collect::<Vec<String>>());
+    
+    let mut reset_count = 0;
+    let mut error_count = 0;
+    
+    for (sequence_name, _dependency_type, table_name, column_name) in sequences {
+        println!("   Processing sequence: {} (table: {}, column: {})", sequence_name, table_name, column_name);
+        // Get the maximum value from the table
+        let max_value_query = format!(
+            "SELECT COALESCE(MAX({}), 0) as max_val FROM {}",
+            column_name, table_name
+        );
+        
+        match sqlx::query(&max_value_query)
+            .fetch_one(db_pool)
+            .await
+        {
+            Ok(row) => {
+                let max_val: i64 = row.try_get("max_val").unwrap_or(0);
+                let next_val = max_val + 1;
+                
+                // Reset the sequence
+                let reset_query = format!(
+                    "SELECT setval('{}', {}, false)",
+                    sequence_name, next_val
+                );
+                
+                match sqlx::query(&reset_query)
+                    .execute(db_pool)
+                    .await
+                {
+                    Ok(_) => {
+                        println!("✓ Reset sequence {} to {} (table: {}, column: {})", 
+                            sequence_name, next_val, table_name, column_name);
+                        reset_count += 1;
+                    }
+                    Err(e) => {
+                        println!("⚠️  Failed to reset sequence {}: {}", sequence_name, e);
+                        println!("   Reset query: {}", reset_query);
+                        error_count += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                println!("⚠️  Failed to get max value for table {}: {}", table_name, e);
+                error_count += 1;
+            }
+        }
+    }
+    
+    // Special handling for common system tables that often have sequence issues
+    println!("   Performing special reset for common system tables...");
+    reset_common_system_sequences(db_pool).await?;
+    
+    println!("✓ Sequence reset completed: {} successful, {} errors", reset_count, error_count);
+    if error_count > 0 {
+        println!("⚠️  Some sequences failed to reset. This may cause migration issues.");
+    }
+    Ok(())
+}
+
+/// Special handling for common system tables that often have sequence corruption issues
+async fn reset_common_system_sequences(db_pool: &Pool<Postgres>) -> Result<()> {
+    let common_tables = vec![
+        "migrations",
+        "schema_migrations", 
+        "users",
+        "permissions",
+        "groups"
+    ];
+    
+    for table_name in common_tables {
+        let sequence_name = format!("{}_id_seq", table_name);
+        let max_value_query = format!("SELECT COALESCE(MAX(id), 0) as max_val FROM {}", table_name);
+        println!("   Processing common table: {} with sequence: {}", table_name, sequence_name);
+        
+        match sqlx::query(&max_value_query)
+            .fetch_one(db_pool)
+            .await
+        {
+            Ok(row) => {
+                let max_val: i64 = row.try_get("max_val").unwrap_or(0);
+                let next_val = max_val + 1;
+                
+                let reset_query = format!(
+                    "SELECT setval('{}', {}, false)",
+                    sequence_name, next_val
+                );
+                
+                if let Err(e) = sqlx::query(&reset_query)
+                    .execute(db_pool)
+                    .await
+                {
+                    println!("⚠️  Failed to reset common sequence {}: {}", sequence_name, e);
+                } else {
+                    println!("✓ Reset common sequence {} to {}", sequence_name, next_val);
+                }
+            }
+            Err(e) => {
+                // Table might not exist, which is fine
+                if !e.to_string().contains("does not exist") {
+                    println!("⚠️  Failed to get max value for common table {}: {}", table_name, e);
+                    println!("   Max value query: {}", max_value_query);
+                } else {
+                    println!("   Table {} does not exist, skipping sequence reset", table_name);
+                }
+            }
+        }
+    }
+    
     Ok(())
 }

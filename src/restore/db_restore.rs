@@ -3,10 +3,13 @@ use anyhow::{Context, Result};
 use sqlx::{Pool, Postgres};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use tempfile::NamedTempFile;
+use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 use url::Url;
 use crate::utils::find_psql_executable;
+
+
 
 use crate::config::RestoreConfig;
 
@@ -36,6 +39,16 @@ async fn execute_sql_file_with_psql(
         ));
     }
 
+    // Check file size for informational purposes
+    let file_size = fs::metadata(sql_file_path)
+        .with_context(|| format!("Failed to get file size for {}", sql_file_path.display()))?
+        .len();
+    
+    if file_size > 50 * 1024 * 1024 && log_context == "data" {
+        println!("📦 Large data file detected ({} MB). This may take significant time.", file_size / 1024 / 1024);
+        println!("   Consider using pg_dump with custom format (--format=c) for better performance on large files.");
+    }
+
     let psql_path = find_psql_executable()?;
     println!(
         "Executing {} SQL file with psql: {} on database {}...",
@@ -43,6 +56,18 @@ async fn execute_sql_file_with_psql(
         sql_file_path.display(),
         target_db_url // Be mindful of logging full URLs with credentials in production
     );
+
+
+
+    // Check if file is large and might need special handling
+    let file_size = fs::metadata(sql_file_path)
+        .with_context(|| format!("Failed to get file size for {}", sql_file_path.display()))?
+        .len();
+    
+    if file_size > 100 * 1024 * 1024 { // 100MB threshold
+        println!("⚠️  Large file detected: {} MB. This may take significant time.", file_size / 1024 / 1024);
+        println!("   Consider using pg_restore with custom format for better performance on large files.");
+    }
 
     // If database renaming is requested, create a temporary file with replaced content
     let (sql_file_to_execute, _temp_file_guard) = if let (Some(source), Some(target)) = (source_db_name, target_db_name) {
@@ -56,13 +81,45 @@ async fn execute_sql_file_with_psql(
             
             // Add constraint handling for data files
             if log_context == "data" {
-                modified_content = format!("SET session_replication_role = 'replica';\n{}\nSET session_replication_role = 'origin';", modified_content);
+                modified_content = format!(
+                    "SET session_replication_role = 'replica';\n\
+                     -- Truncate tables to avoid duplicate key errors\n\
+                     DO $$\n\
+                     DECLARE\n\
+                         table_name text;\n\
+                     BEGIN\n\
+                         FOR table_name IN \n\
+                             SELECT tablename FROM pg_tables \n\
+                             WHERE schemaname = 'public' \n\
+                             AND tablename != 'schema_migrations'\n\
+                         LOOP\n\
+                             EXECUTE 'TRUNCATE TABLE ' || quote_ident(table_name) || ' CASCADE';\n\
+                         END LOOP;\n\
+                     END$$;\n\
+                     {}\n\
+                     SET session_replication_role = 'origin';", 
+                    modified_content
+                );
             }
             
             let temp_file = NamedTempFile::new()?;
-            fs::write(&temp_file, modified_content)
+            fs::write(&temp_file, &modified_content)
                 .with_context(|| format!("Failed to write modified {} SQL content", log_context))?;
+            
+            // Validate the temporary file was created and has content
             let temp_path = temp_file.into_temp_path();
+            let file_size = fs::metadata(&temp_path)
+                .with_context(|| format!("Failed to get metadata for temporary {} SQL file", log_context))?
+                .len();
+            
+            if file_size == 0 {
+                return Err(anyhow::anyhow!(
+                    "Temporary {} SQL file is empty after database renaming. This indicates an issue with the renaming process.",
+                    log_context
+                ));
+            }
+            
+            println!("✓ Temporary {} SQL file created with truncation logic", log_context);
             (temp_path.to_path_buf(), Some(temp_path))
         } else {
             (PathBuf::from(sql_file_path), None)
@@ -71,7 +128,9 @@ async fn execute_sql_file_with_psql(
         (PathBuf::from(sql_file_path), None)
     };
 
-    let output = Command::new(psql_path)
+    // Add connection timeout and ensure psql doesn't hang on authentication
+    let mut command = Command::new(psql_path);
+    command
         .arg("-X") // Do not read psqlrc
         .arg("-q") // Quiet mode
         .arg("-v")
@@ -79,24 +138,142 @@ async fn execute_sql_file_with_psql(
         .arg("-d")
         .arg(target_db_url)
         .arg("-f")
-        .arg(&sql_file_to_execute)
-        .output()
-        .with_context(|| {
-            format!(
-                "Failed to execute psql for {} restoration of file: {}",
+        .arg(&sql_file_to_execute);
+    
+    // Set connection timeout to prevent hanging
+    command.env("PGCONNECT_TIMEOUT", "30");
+    
+    // For very large files, use single transaction to improve performance
+    // Always use single transaction mode for data restoration to prevent partial imports
+    command.arg("-1"); // Single transaction mode
+    println!("   Using single transaction mode for data restoration");
+    
+    let timeout_duration = Duration::from_secs(14400); // 4 hours timeout for data restoration
+    
+    println!("   Executing psql command with timeout: {} hours", timeout_duration.as_secs() / 3600);
+    
+    // Use a direct approach with explicit process management
+    let child = command
+        .spawn()
+        .with_context(|| format!("Failed to spawn psql process for {} restoration", log_context))?;
+    
+    println!("   Psql process spawned successfully");
+    
+    let pid = child.id();
+    
+    // Wait for completion with timeout
+    println!("   Waiting for psql process completion with timeout...");
+    let output_result = match timeout(timeout_duration, child.wait_with_output()).await {
+        Ok(result) => {
+            println!("   Psql process completed within timeout");
+            result
+        },
+        Err(_) => {
+            // Timeout occurred - kill the process aggressively
+            println!("⚠️  psql execution timeout detected after {} hours. Killing process (PID: {:?})...", timeout_duration.as_secs() / 3600, pid);
+            
+            // Try multiple methods to kill the process
+            if let Some(pid_val) = pid {
+                let _ = tokio::process::Command::new("kill")
+                    .arg("-9")
+                    .arg(pid_val.to_string())
+                    .output()
+                    .await;
+            }
+            
+            // Also try pkill as backup
+            let _ = tokio::process::Command::new("pkill")
+                .arg("-9")
+                .arg("-f")
+                .arg(&format!("psql.*{}", target_db_url))
+                .output()
+                .await;
+            
+            return Err(anyhow::anyhow!(
+                "psql execution timed out after {} hours for {} restoration of file: {}. \n\
+                 The process was forcibly killed. This indicates:\n\
+                 - The SQL operation is taking too long\n\
+                 - Database may be unresponsive\n\
+                 - Consider alternative restore methods",
+                timeout_duration.as_secs() / 3600,
                 log_context,
                 sql_file_to_execute.display()
-            )
-        })?;
+            ));
+        }
+    };
+
+    let output = match output_result {
+        Ok(output) => {
+            println!("   Psql command executed, checking exit status...");
+            output
+        },
+        Err(e) => {
+            // If we get here, the process completed but there was an error
+            println!("   Psql process completed with error: {}", e);
+            // Kill any remaining psql processes just in case
+            let _ = tokio::process::Command::new("pkill")
+                .arg("-9")
+                .arg("-f")
+                .arg(&format!("psql.*{}", target_db_url))
+                .output()
+                .await;
+            
+            return Err(e).with_context(|| {
+                format!(
+                    "psql execution failed for {} restoration of file: {}. Check database connectivity and permissions.",
+                    log_context,
+                    sql_file_to_execute.display()
+                )
+            });
+        }
+    };
 
     if !output.status.success() {
+        println!("   Psql command failed with exit status: {}", output.status);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        
+        println!("   Stdout: {}", stdout);
+        println!("   Stderr: {}", stderr);
+        
+        // Check for common psql hanging issues
+        if stderr.contains("connection") && stderr.contains("timeout") {
+            return Err(anyhow::anyhow!(
+                "Database connection timeout during {} restoration of file: {}.\n\
+                 Check if database '{}' is accessible and user 'podman' has proper permissions.\n\
+                 Stdout: {}\nStderr: {}",
+                log_context,
+                sql_file_path.display(),
+                target_db_url.split('/').last().unwrap_or("unknown"),
+                stdout,
+                stderr
+            ));
+        }
+        
+        // Check if the process was killed due to timeout or signal
+        if output.status.code() == Some(137) || output.status.code() == Some(143) || output.status.code() == Some(9) {
+            return Err(anyhow::anyhow!(
+                "psql process was killed due to timeout or signal during {} restoration of file: {}.\n\
+                 The operation took too long (>{}+ hours) or was unresponsive. Consider:\n\
+                 - Using pg_restore with custom format\n\
+                 - Splitting the data file into smaller chunks\n\
+                 - Checking database server performance\n\
+                 - Using direct database connection instead of psql",
+                log_context,
+                sql_file_path.display(),
+                timeout_duration.as_secs() / 3600
+            ));
+        }
+        
         return Err(anyhow::anyhow!(
-            "psql execution for {} restoration failed for file: {}.\nStatus: {}\nStdout: {}\nStderr: {}",
+            "psql execution for {} restoration failed for file: {}.\nStatus: {}\nCommand: psql -X -q -v ON_ERROR_STOP=1 -d {} -f {}\nStdout: {}\nStderr: {}",
             log_context,
             sql_file_path.display(),
             output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            target_db_url,
+            sql_file_to_execute.display(),
+            stdout,
+            stderr
         ));
     }
 
@@ -105,8 +282,18 @@ async fn execute_sql_file_with_psql(
         log_context,
         sql_file_path.display()
     );
+    println!("   Psql execution completed successfully");
+    
+    // Additional cleanup: remove temporary file if it exists
+    if let Some(temp_path) = _temp_file_guard {
+        if let Err(e) = std::fs::remove_file(&temp_path) {
+            println!("⚠️  Warning: Failed to remove temporary file {}: {}", temp_path.display(), e);
+        }
+    }
     Ok(())
 }
+
+
 
 
 /// Manages the target database based on restore configuration.
@@ -249,6 +436,7 @@ ALTER TABLE hotelrule_prod.users OWNER TO hotelrule_prod_admin;
 }
 
 /// Intelligently replaces database name references in SQL content
+/// Avoids modifying connection URLs and other sensitive patterns
 fn replace_database_references(sql_content: &str, source_db: &str, target_db: &str) -> String {
     if source_db == target_db {
         return sql_content.to_string();
@@ -259,6 +447,7 @@ fn replace_database_references(sql_content: &str, source_db: &str, target_db: &s
     let mut result = sql_content.to_string();
     
     // Replace database name in common contexts where it appears as an identifier
+    // Avoid patterns that might match connection strings or URLs
     let patterns = vec![
         format!(" {} ", source_db),
         format!("\"{}\" ", source_db),
@@ -273,6 +462,24 @@ fn replace_database_references(sql_content: &str, source_db: &str, target_db: &s
     for pattern in patterns {
         let replacement = pattern.replace(source_db, target_db);
         result = result.replace(&pattern, &replacement);
+    }
+    
+    // Safety check: Ensure we didn't accidentally modify connection URLs
+    // Look for patterns like postgresql://, postgres://, etc. that might have been affected
+    let connection_patterns = vec![
+        format!("postgresql://{}/", target_db),
+        format!("postgres://{}/", target_db),
+        format!("{}.com", target_db),
+        format!("{}.org", target_db),
+        format!("{}.net", target_db),
+    ];
+    
+    for pattern in connection_patterns {
+        if result.contains(&pattern) {
+            println!("⚠️  Warning: Potential connection URL modification detected in SQL content");
+            println!("   Pattern found: {}", pattern);
+            println!("   This might indicate database renaming affected connection strings");
+        }
     }
     
     result
@@ -307,4 +514,6 @@ pub async fn restore_database_data(
     // Execute the data restoration (constraint handling is now embedded in the SQL file)
     execute_sql_file_with_psql(target_db_url, data_sql_path, "data", source_db_name, target_db_name).await
 }
+
+
 

@@ -128,7 +128,7 @@ pub async fn dump_databases(
             return Err(anyhow::anyhow!(
                 "pg_dump (data) for database {} failed with status: {}\nStdout: {}\nStderr: {}",
                 db_name,
-                data_dump_cmd_output.status,
+                schema_dump_cmd_output.status,
                 String::from_utf8_lossy(&data_dump_cmd_output.stdout),
                 String::from_utf8_lossy(&data_dump_cmd_output.stderr)
             ));
@@ -141,6 +141,8 @@ pub async fn dump_databases(
 
     Ok(successfully_dumped_dbs)
 }
+
+
 
 async fn get_database_list(conn: &mut PgConnection) -> Result<Vec<String>> {
     println!("Fetching list of databases...");

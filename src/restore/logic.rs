@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
 use url::Url;
 
 use crate::config::{AppConfig, RestoreConfig};
@@ -152,14 +153,26 @@ pub async fn perform_restore_orchestration(
         actual_target_db_conn_url.set_path(target_db_name);
         let actual_target_db_conn_url_str = actual_target_db_conn_url.to_string();
 
+        // Debug: log the actual connection URL being used
+        println!("Using connection URL: {}", actual_target_db_conn_url_str);
+
+        // Verify the target database was actually created before attempting to connect
+        println!("Verifying target database '{}' exists and is accessible...", target_db_name);
+        
         // Create a connection pool to the target database for schema/data restore and verification
         println!("Connecting to target database \'{}\' for restore operations...", target_db_name);
         let target_db_pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(5) // Adjust as needed
             .connect(&actual_target_db_conn_url_str)
             .await
-            .with_context(|| format!("Failed to connect to target database \'{}\' at {} for restore operations", target_db_name, actual_target_db_conn_url_str))?;
+            .with_context(|| format!("Failed to connect to target database \'{}\' at {} for restore operations. Please check if the database exists and the user has proper permissions.", target_db_name, actual_target_db_conn_url_str))?;
 
+        // Verify we can actually query the database
+        sqlx::query("SELECT 1")
+            .fetch_one(&target_db_pool)
+            .await
+            .with_context(|| format!("Target database '{}' exists but is not responsive", target_db_name))?;
+        println!("✓ Target database '{}' is accessible", target_db_name);
 
         // Find schema and data files for `db_name_from_archive`
         // The archive files are named like `dbname_YYYY-MM-DD_HH_MM_SS_schema.sql` or `dbname_schema.sql`
@@ -173,6 +186,24 @@ pub async fn perform_restore_orchestration(
         let data_file_name = format!("{}_data.sql", db_name_from_archive);
         let data_file_path = extracted_files_path.join(&data_file_name);
 
+        // For data restoration, perform additional connection stress test
+        if data_file_path.exists() {
+            println!("Performing connection stress test before large data restore...");
+            for i in 1..=3 {
+                match sqlx::query(&format!("SELECT {} as test_value", i))
+                    .fetch_one(&target_db_pool)
+                    .await
+                {
+                    Ok(_) => println!("✓ Connection test {} successful", i),
+                    Err(e) => {
+                        println!("⚠️  Connection test {} failed: {}", i, e);
+                        println!("   This may indicate database performance issues that could cause large data restore to hang");
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+
         if !schema_file_path.exists() {
             return Err(anyhow::anyhow!(
                 "Schema file not found for database '{}' in extracted archive: {}. Expected pattern: {}_schema.sql",
@@ -180,13 +211,13 @@ pub async fn perform_restore_orchestration(
             ));
         }
          if !data_file_path.exists() {
-            // Data file might be optional for some backup types (e.g. schema-only)
-            // However, our current backup process creates both.
-            println!(
-                "Warning: Data file not found for database '{}' in extracted archive: {}. Expected pattern: {}_data.sql. Proceeding with schema restore only.",
-                db_name_from_archive, data_file_path.display(), db_name_from_archive
-            );
-        }
+             // Data file might be optional for some backup types (e.g. schema-only)
+             // However, our current backup process creates both.
+             println!(
+                 "Warning: Data file not found for database '{}' in extracted archive: {}. Expected pattern: {}_data.sql. Proceeding with schema restore only.",
+                 db_name_from_archive, data_file_path.display(), db_name_from_archive
+             );
+         }
 
         // 4a. Restore schema
         println!("Restoring schema for {} from {}...", db_name_from_archive, schema_file_path.display());
@@ -237,6 +268,12 @@ fn discover_databases_from_archive(extracted_path: &Path) -> Result<Vec<String>>
                             db_names.push(db_name.to_string());
                         }
                     }
+                } else if file_name.ends_with("_data.sql") {
+                    if let Some(db_name) = file_name.strip_suffix("_data.sql") {
+                        if !db_name.is_empty() && !db_names.contains(&db_name.to_string()) {
+                            db_names.push(db_name.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -244,7 +281,7 @@ fn discover_databases_from_archive(extracted_path: &Path) -> Result<Vec<String>>
     db_names.sort();
     db_names.dedup();
     if db_names.is_empty() {
-         println!("Warning: Could not discover any database schema files (*_schema.sql) in the archive at {}", extracted_path.display());
+         println!("Warning: Could not discover any database files (*_schema.sql or *_data.sql) in the archive at {}", extracted_path.display());
     } else {
         println!("Discovered databases from archive: {:?}", db_names);
     }
