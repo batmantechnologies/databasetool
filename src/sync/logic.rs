@@ -75,6 +75,9 @@ pub async fn perform_sync_orchestration(
         println!("Dumping schema for {} from {} to {}...", db_name, source_db_specific_url, schema_file_path.display());
         let schema_dump_cmd_output = Command::new(&pg_dump_path)
             .arg("--schema-only")
+            .arg("--format=custom") // Use custom format for pg_restore compatibility
+            .arg("--no-comments") // Skip comments that might contain unsupported settings
+            .arg("--no-tablespaces") // Skip tablespace settings that might not be compatible
             .arg("-f")
             .arg(&schema_file_path)
             .arg(&source_db_specific_url)
@@ -98,6 +101,8 @@ pub async fn perform_sync_orchestration(
         let data_dump_cmd_output = Command::new(&pg_dump_path)
             .arg("--data-only")
             .arg("--format=custom") // Use custom format for pg_restore compatibility
+            .arg("--no-comments") // Skip comments that might contain unsupported settings
+            .arg("--no-tablespaces") // Skip tablespace settings that might not be compatible
             .arg("-f")
             .arg(&data_file_path)
             .arg(&source_db_specific_url)

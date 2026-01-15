@@ -99,10 +99,20 @@ async fn reset_sequences(db_pool: &Pool<Postgres>, db_name: &str) -> Result<()> 
             tab.relname, attr.attname
     "#;
     
-    let sequences: Vec<(String, String, String, String)> = sqlx::query_as(sequences_query)
+    // Use generic row fetching to avoid type mismatches
+    let sequences_rows = sqlx::query(sequences_query)
         .fetch_all(db_pool)
         .await
         .context("Failed to fetch sequence information")?;
+    
+    let mut sequences: Vec<(String, String, String, String)> = Vec::new();
+    for row in sequences_rows {
+        let sequence_name: String = row.try_get(0).unwrap_or_else(|_| "unknown_sequence".to_string());
+        let dependency_type: String = row.try_get(1).unwrap_or_else(|_| "a".to_string());
+        let table_name: String = row.try_get(2).unwrap_or_else(|_| "unknown_table".to_string());
+        let column_name: String = row.try_get(3).unwrap_or_else(|_| "unknown_column".to_string());
+        sequences.push((sequence_name, dependency_type, table_name, column_name));
+    }
     
     if sequences.is_empty() {
         println!("ℹ️  No sequences found in public schema for database: {}", db_name);

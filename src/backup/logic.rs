@@ -86,7 +86,15 @@ pub async fn perform_backup_orchestration(
             // Optional: Perform a connection check. Could be made configurable.
             // s3_upload::check_s3_connection(spaces_conf).await.context("S3 connection check failed")?;
 
-            let s3_key = format!("database_backups/{}", archive_file_name); // Example S3 key structure
+            let s3_key = if let Some(prefix) = &spaces_conf.folder_prefix {
+                if prefix.is_empty() {
+                    archive_file_name.clone()
+                } else {
+                    format!("{}/{}", prefix.trim_end_matches('/'), archive_file_name)
+                }
+            } else {
+                format!("database_backups/{}", archive_file_name) // Default prefix if none provided
+            };
 
             s3_upload::upload_file_to_s3(spaces_conf, &final_archive_path, &s3_key)
                 .await

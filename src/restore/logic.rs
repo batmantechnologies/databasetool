@@ -94,6 +94,27 @@ pub async fn perform_restore_orchestration(
         println!("  - {}", entry.path().display());
     }
 
+    // Check if there's a subdirectory and use that instead
+    let actual_extracted_path = if let Ok(entries) = fs::read_dir(extracted_files_path) {
+        let mut subdirs: Vec<PathBuf> = Vec::new();
+        for entry in entries {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                if path.is_dir() {
+                    subdirs.push(path);
+                }
+            }
+        }
+        if subdirs.len() == 1 {
+            println!("Using subdirectory for extracted files: {}", subdirs[0].display());
+            subdirs[0].clone()
+        } else {
+            extracted_files_path.to_path_buf()
+        }
+    } else {
+        extracted_files_path.to_path_buf()
+    };
+
     // 3. Determine which databases to restore
     //    If `restore_config.databases_to_restore` is Some, use that mapping.
     //    If None, discover databases from the extracted files and map them to themselves.
@@ -101,14 +122,14 @@ pub async fn perform_restore_orchestration(
     if let Some(dbs_from_config) = &restore_config.databases_to_restore {
         if dbs_from_config.is_empty() {
              println!("DATABASE_LIST is empty in config. Attempting to discover databases from archive.");
-             let discovered_dbs = discover_databases_from_archive(extracted_files_path)?;
+             let discovered_dbs = discover_databases_from_archive(&actual_extracted_path)?;
              databases_to_process = discovered_dbs.into_iter().map(|db| (db.clone(), db)).collect();
         } else {
             databases_to_process = dbs_from_config.clone();
         }
     } else {
         println!("No DATABASE_LIST in config. Attempting to discover databases from archive.");
-        let discovered_dbs = discover_databases_from_archive(extracted_files_path)?;
+        let discovered_dbs = discover_databases_from_archive(&actual_extracted_path)?;
         databases_to_process = discovered_dbs.into_iter().map(|db| (db.clone(), db)).collect();
     }
 
@@ -176,15 +197,69 @@ pub async fn perform_restore_orchestration(
 
         // Find schema and data files for `db_name_from_archive`
         // The archive files are named like `dbname_YYYY-MM-DD_HH_MM_SS_schema.sql` or `dbname_schema.sql`
-        // We need to find the correct schema/data files within `extracted_files_path`
+        // Or for dump files: `dbname_YYYY-MM-DD_HH_MM_SS.dump`
+        // We need to find the correct schema/data files within `actual_extracted_path`
         // that correspond to `db_name_from_archive`.
         // The `db_dump` module created files like `DBNAME_schema.sql` and `DBNAME_data.sql`.
-        
+    
         let schema_file_name = format!("{}_schema.sql", db_name_from_archive);
-        let schema_file_path = extracted_files_path.join(&schema_file_name);
+        let schema_file_path = actual_extracted_path.join(&schema_file_name);
 
         let data_file_name = format!("{}_data.sql", db_name_from_archive);
-        let data_file_path = extracted_files_path.join(&data_file_name);
+        let data_file_path = actual_extracted_path.join(&data_file_name);
+    
+        // Check for dump file (alternative format)
+        let mut dump_file_path = None;
+        for entry in fs::read_dir(&actual_extracted_path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(file_name_os) = path.file_name() {
+                    let file_name = file_name_os.to_string_lossy();
+                    // Check if this is a dump file for our database
+                    if file_name.starts_with(&format!("{}_", db_name_from_archive)) && file_name.ends_with(".dump") {
+                        dump_file_path = Some(path);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Also check in subdirectories
+        if dump_file_path.is_none() {
+            if let Ok(entries) = fs::read_dir(&actual_extracted_path) {
+                for entry in entries {
+                    if let Ok(entry) = entry {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            if let Ok(sub_entries) = fs::read_dir(&path) {
+                                for sub_entry in sub_entries {
+                                    if let Ok(sub_entry) = sub_entry {
+                                        let sub_path = sub_entry.path();
+                                        if sub_path.is_file() {
+                                            if let Some(file_name_os) = sub_path.file_name() {
+                                                let file_name = file_name_os.to_string_lossy();
+                                                // Check if this is a dump file for our database
+                                                if file_name.starts_with(&format!("{}_", db_name_from_archive)) && file_name.ends_with(".dump") {
+                                                    dump_file_path = Some(sub_path);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if dump_file_path.is_some() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if dump_file_path.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
 
         // For data restoration, perform additional connection stress test
         if data_file_path.exists() {
@@ -204,41 +279,53 @@ pub async fn perform_restore_orchestration(
             }
         }
 
-        if !schema_file_path.exists() {
-            return Err(anyhow::anyhow!(
-                "Schema file not found for database '{}' in extracted archive: {}. Expected pattern: {}_schema.sql",
-                db_name_from_archive, schema_file_path.display(), db_name_from_archive
-            ));
-        }
-         if !data_file_path.exists() {
-             // Data file might be optional for some backup types (e.g. schema-only)
-             // However, our current backup process creates both.
-             println!(
-                 "Warning: Data file not found for database '{}' in extracted archive: {}. Expected pattern: {}_data.sql. Proceeding with schema restore only.",
-                 db_name_from_archive, data_file_path.display(), db_name_from_archive
-             );
-         }
-
-        // 4a. Restore schema
-        println!("Restoring schema for {} from {}...", db_name_from_archive, schema_file_path.display());
-        db_restore::restore_database_schema(&actual_target_db_conn_url_str, &schema_file_path, Some(db_name_from_archive), Some(target_db_name))
-            .await
-            .with_context(|| format!("Failed to restore schema for database \'{}\' from file {}", db_name_from_archive, schema_file_path.display()))?;
-        println!("✓ Schema restoration completed for {}.", db_name_from_archive);
-
-        // 4b. Restore data (if data file exists)
-        if data_file_path.exists() {
-            println!("Restoring data for {} from {}...", db_name_from_archive, data_file_path.display());
-            db_restore::restore_database_data(&actual_target_db_conn_url_str, &data_file_path, Some(db_name_from_archive), Some(target_db_name))
+        // Check if we have dump file instead of separate schema/data files
+        if let Some(dump_path) = &dump_file_path {
+            println!("Found dump file for database '{}': {}", db_name_from_archive, dump_path.display());
+            // Use dump file restoration
+            println!("Restoring database '{}' from dump file {}...", db_name_from_archive, dump_path.display());
+            db_restore::restore_database_from_dump(&actual_target_db_conn_url_str, dump_path, Some(db_name_from_archive), Some(target_db_name))
                 .await
-                .with_context(|| format!("Failed to restore data for database \'{}\' from file {}", db_name_from_archive, data_file_path.display()))?;
-            println!("✓ Data restoration completed for {}.", db_name_from_archive);
+                .with_context(|| format!("Failed to restore database '{}' from dump file {}", db_name_from_archive, dump_path.display()))?;
+            println!("✓ Database '{}' restored successfully from dump file.", db_name_from_archive);
         } else {
-             println!("Skipping data restoration for {} as data file was not found.", db_name_from_archive);
+            // Use separate schema/data files
+            if !schema_file_path.exists() {
+                return Err(anyhow::anyhow!(
+                    "Schema file not found for database '{}' in extracted archive: {}. Expected pattern: {}_schema.sql",
+                    db_name_from_archive, schema_file_path.display(), db_name_from_archive
+                ));
+            }
+             if !data_file_path.exists() {
+                 // Data file might be optional for some backup types (e.g. schema-only)
+                 // However, our current backup process creates both.
+                 println!(
+                     "Warning: Data file not found for database '{}' in extracted archive: {}. Expected pattern: {}_data.sql. Proceeding with schema restore only.",
+                     db_name_from_archive, data_file_path.display(), db_name_from_archive
+                 );
+             }
+
+            // 4a. Restore schema
+            println!("Restoring schema for {} from {}...", db_name_from_archive, schema_file_path.display());
+            db_restore::restore_database_schema(&actual_target_db_conn_url_str, &schema_file_path, Some(db_name_from_archive), Some(target_db_name))
+                .await
+                .with_context(|| format!("Failed to restore schema for database \'{}\' from file {}", db_name_from_archive, schema_file_path.display()))?;
+            println!("✓ Schema restoration completed for {}.", db_name_from_archive);
+
+            // 4b. Restore data (if data file exists)
+            if data_file_path.exists() {
+                println!("Restoring data for {} from {}...", db_name_from_archive, data_file_path.display());
+                db_restore::restore_database_data(&actual_target_db_conn_url_str, &data_file_path, Some(db_name_from_archive), Some(target_db_name))
+                    .await
+                    .with_context(|| format!("Failed to restore data for database \'{}\' from file {}", db_name_from_archive, data_file_path.display()))?;
+                println!("✓ Data restoration completed for {}.", db_name_from_archive);
+            } else {
+                 println!("Skipping data restoration for {} as data file was not found.", db_name_from_archive);
+            }
         }
 
         // 4c. Verify restore for this database
-        verification::verify_restore(&target_db_pool, restore_config, target_db_name, extracted_files_path)
+        verification::verify_restore(&target_db_pool, restore_config, target_db_name, &actual_extracted_path)
             .await
             .with_context(|| format!("Failed to verify_restore for database \'{}\'", target_db_name))?;
         
@@ -253,7 +340,7 @@ pub async fn perform_restore_orchestration(
 
 
 /// Discovers database names from the files in the extracted archive directory.
-/// Looks for files matching `*_schema.sql`.
+/// Looks for files matching `*_schema.sql`, `*_data.sql`, or `*.dump`.
 fn discover_databases_from_archive(extracted_path: &Path) -> Result<Vec<String>> {
     let mut db_names = Vec::new();
     for entry in fs::read_dir(extracted_path)? {
@@ -274,6 +361,38 @@ fn discover_databases_from_archive(extracted_path: &Path) -> Result<Vec<String>>
                             db_names.push(db_name.to_string());
                         }
                     }
+                } else if file_name.ends_with(".dump") {
+                    // Handle .dump files from pg_dump --format=custom
+                    // Pattern: DBNAME_YYYY-MM-DD_HH_MM_SS.dump
+                    let file_name_without_ext = file_name.trim_end_matches(".dump");
+                    // Extract database name by removing the timestamp part
+                    // Find the last underscore before the timestamp
+                    if let Some(last_underscore_pos) = file_name_without_ext.rfind('_') {
+                        // Check if the part after the last underscore looks like HH_MM_SS
+                        let time_part = &file_name_without_ext[last_underscore_pos + 1..];
+                        if time_part.len() == 8 && time_part.chars().all(|c| c.is_ascii_digit() || c == '_') {
+                            // Remove the time part
+                            let db_name_with_date = &file_name_without_ext[..last_underscore_pos];
+                            // Find another underscore for the date part
+                            if let Some(date_underscore_pos) = db_name_with_date.rfind('_') {
+                                // Check if the part after the underscore looks like YYYY-MM-DD
+                                let date_part = &db_name_with_date[date_underscore_pos + 1..];
+                                if date_part.len() >= 10 && date_part.chars().take(4).all(|c| c.is_ascii_digit()) {
+                                    // Extract the database name
+                                    let db_name = &db_name_with_date[..date_underscore_pos];
+                                    if !db_name.is_empty() && !db_names.contains(&db_name.to_string()) {
+                                        db_names.push(db_name.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Fallback: if we couldn't extract a database name, use the whole filename without .dump
+                    if db_names.is_empty() {
+                        if !file_name_without_ext.is_empty() {
+                            db_names.push(file_name_without_ext.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -281,7 +400,7 @@ fn discover_databases_from_archive(extracted_path: &Path) -> Result<Vec<String>>
     db_names.sort();
     db_names.dedup();
     if db_names.is_empty() {
-         println!("Warning: Could not discover any database files (*_schema.sql or *_data.sql) in the archive at {}", extracted_path.display());
+         println!("Warning: Could not discover any database files (*_schema.sql, *_data.sql, or *.dump) in the archive at {}", extracted_path.display());
     } else {
         println!("Discovered databases from archive: {:?}", db_names);
     }
