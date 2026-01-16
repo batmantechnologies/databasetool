@@ -1,6 +1,6 @@
 // databasetool/src/utils/sequence_reset.rs
 use anyhow::{Context, Result};
-use sqlx::{Pool, Postgres};
+use sqlx::{Pool, Postgres, Row};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -58,11 +58,23 @@ pub async fn reset_all_sequences(db_pool: &Pool<Postgres>, db_name: &str) -> Res
             column_name, table_name
         );
         
-        match sqlx::query_scalar::<_, i64>(&max_value_query)
+        // Use a more flexible approach to handle different integer types
+        match sqlx::query(&max_value_query)
             .fetch_one(db_pool)
             .await
         {
-            Ok(max_val) => {
+            Ok(row) => {
+                // Try different integer types to handle INT4 (i32) and INT8 (i64)
+                let max_val = if let Ok(val) = row.try_get::<i64, _>("max_val") {
+                    val
+                } else if let Ok(val) = row.try_get::<i32, _>("max_val") {
+                    val as i64
+                } else {
+                    println!("⚠️  Failed to parse max value for table {} - unsupported type", table_name);
+                    error_count += 1;
+                    continue;
+                };
+                
                 let next_val = max_val + 1;
                 
                 // Reset the sequence
@@ -117,11 +129,21 @@ async fn reset_common_system_sequences(db_pool: &Pool<Postgres>) -> Result<()> {
         let sequence_name = format!("{}_{}_seq", table_name, column_name);
         let max_value_query = format!("SELECT COALESCE(MAX({}), 0) as max_val FROM {}", column_name, table_name);
         
-        match sqlx::query_scalar::<_, i64>(&max_value_query)
+        match sqlx::query(&max_value_query)
             .fetch_one(db_pool)
             .await
         {
-            Ok(max_val) => {
+            Ok(row) => {
+                // Try different integer types to handle INT4 (i32) and INT8 (i64)
+                let max_val = if let Ok(val) = row.try_get::<i64, _>("max_val") {
+                    val
+                } else if let Ok(val) = row.try_get::<i32, _>("max_val") {
+                    val as i64
+                } else {
+                    println!("   Note: Could not parse max value for table {} - unsupported type", table_name);
+                    continue;
+                };
+                
                 let next_val = max_val + 1;
                 let reset_query = format!("SELECT setval('{}', {}, false)", sequence_name, next_val);
                 
