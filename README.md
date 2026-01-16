@@ -11,6 +11,7 @@
   - [🛡️ Robust Backups](#️-robust-backups)
   - [🔄 Flawless Restores](#-flawless-restores)
   - [⚙️ Intelligent Sync](#️-intelligent-sync)
+- [🔧 Sequence Reset Solution](#-sequence-reset-solution)
 - [Prerequisites](#prerequisites)
 - [Quick Start: Installation](#quick-start-installation)
 - [Configuration: Your Central Command](#configuration-your-central-command)
@@ -53,6 +54,43 @@ Get your systems back online quickly or set up new environments with ease.
 *   **From Local or Cloud:** Restore from local backup files or directly download from S3-compatible storage.
 *   **Targeted Restoration:** Precisely restore data to your specified target database.
 *   **Handles Complexity:** Manages the intricacies of the restore process, ensuring data integrity.
+
+### ⚙️ Intelligent Sync
+
+## 🔧 Sequence Reset Solution
+
+When restoring PostgreSQL databases, you may encounter errors like:
+
+```
+duplicate key value violates unique constraint "otp_pkey"
+Key (id)=(1) already exists.
+```
+
+This occurs because PostgreSQL sequences (which control auto-incrementing primary keys) are not properly synchronized with the existing data after a restore operation.
+
+### Automatic Fix
+
+DatabaseTool now automatically resets all sequences after data restoration to prevent these errors. This happens in two places:
+
+1. **During Restore**: Sequences are reset immediately after data is restored
+2. **During Verification**: Additional sequence reset is performed as part of verification
+
+### Manual Solutions
+
+If you need to manually reset sequences, DatabaseTool provides two options:
+
+#### Standalone Shell Script
+```bash
+./reset_sequences.sh postgresql://username:password@host:port/database_name
+```
+
+#### SQL Script
+Execute `reset_sequences.sql` directly in your database:
+```bash
+psql -d your_database -f reset_sequences.sql
+```
+
+For more details about the sequence reset solution, see [SEQUENCE_RESET_README.md](SEQUENCE_RESET_README.md).
 
 ### ⚙️ Intelligent Sync
 

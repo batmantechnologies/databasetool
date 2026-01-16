@@ -319,12 +319,19 @@ pub async fn perform_restore_orchestration(
                     .await
                     .with_context(|| format!("Failed to restore data for database \'{}\' from file {}", db_name_from_archive, data_file_path.display()))?;
                 println!("✓ Data restoration completed for {}.", db_name_from_archive);
+                
+                // 4c. Reset sequences immediately after data restore to prevent key conflicts
+                println!("Resetting sequences for database {} after data restore...", target_db_name);
+                crate::utils::sequence_reset::reset_sequences_with_timeout(&target_db_pool, target_db_name)
+                    .await
+                    .with_context(|| format!("Failed to reset sequences for database \'{}\'", target_db_name))?;
+                println!("✓ Sequences reset completed for {}.", target_db_name);
             } else {
                  println!("Skipping data restoration for {} as data file was not found.", db_name_from_archive);
             }
         }
 
-        // 4c. Verify restore for this database
+        // 4d. Verify restore for this database (this will also do a final sequence check)
         verification::verify_restore(&target_db_pool, restore_config, target_db_name, &actual_extracted_path)
             .await
             .with_context(|| format!("Failed to verify_restore for database \'{}\'", target_db_name))?;

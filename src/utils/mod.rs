@@ -1,4 +1,5 @@
 pub mod setting;
+pub mod sequence_reset;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
